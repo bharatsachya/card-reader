@@ -482,6 +482,14 @@ used.
 
 ## Authentication
 
+> **Scope note.** Sign-in and the conversational interface were added after the
+> core brief was complete. They are a deliberate extension, not scope drift:
+> the app handles personal data (a named person's employer, phone and email),
+> and without an owner on each record every visitor can read every lead anyone
+> has ever extracted. The general reasoning is in
+> [Why these pieces belong in any real application](#why-these-pieces-belong-in-any-real-application).
+> Everything in the original six stages works unchanged with auth disabled.
+
 Sign-in is [Clerk](https://clerk.com), integrated **without React and without a
 build step** — Clerk publishes `@clerk/clerk-js`, a plain browser bundle that
 exposes a global `Clerk` object.
@@ -584,6 +592,193 @@ The page is a **conversation**: each upload becomes a user turn with
 thumbnails, and the assistant replies with a shimmering status line, a progress
 meter, the leads table, and download buttons. The API underneath is unchanged
 — the chat is how results are *presented*, not a different protocol.
+
+---
+
+## Why these pieces belong in any real application
+
+Several parts of this project are not specific to business cards. They are the
+things that separate a demo from something you could put in front of users, and
+each one exists because of a failure that shows up the first time real people
+use real data. This section explains the general principle behind each, so the
+reasoning transfers to the next application rather than staying here.
+
+### Authentication is about data, not about logins
+
+It is tempting to treat sign-in as a feature you add when you are ready to
+charge money. It is not. The moment an application holds data that belongs to
+*someone*, three separate problems appear at once, and auth is the only thing
+that solves any of them:
+
+1. **Isolation.** Without a user on the request, every record belongs to
+   everybody. Whoever opens the page sees whatever the last person uploaded.
+   That is not a privacy setting you can add later — it changes the shape of
+   every query, because "list the jobs" becomes "list *this user's* jobs".
+   Retrofitting a `user_id` onto a schema that never had one is one of the
+   more painful migrations there is.
+2. **Accountability.** When something goes wrong — data deleted, a bad export,
+   an abusive upload — "who did this?" has no answer unless requests carry an
+   identity. Logs of anonymous actions tell you what happened and never who.
+3. **Limits that mean anything.** Rate limits, quotas and fair-use rules all
+   need a subject. Limiting by IP address is a poor substitute: it punishes
+   everyone behind one office NAT and is trivially evaded by anyone else.
+
+**This application specifically handles personal data.** A business card is a
+named person's job title, employer, phone number and email address — that is
+personally identifiable information under GDPR, India's DPDP Act and similar
+regimes. Storing PII in a system where any visitor can read any record is not
+merely untidy; it is the kind of thing that becomes a reportable incident.
+Scoping every row to an owner is the minimum bar, and it is why `user_id` is a
+field on `Job` rather than an afterthought.
+
+The related principle is where the check lives:
+
+> Authorisation is enforced on the server, or it is not enforced.
+
+`static/auth.js` decides what the user *sees*. `app/auth.py` decides what the
+user may *do*. Deleting the frontend file entirely would not grant anyone a
+single extra byte of access. Any check that lives only in the browser — a
+hidden button, a filtered list, a header the frontend promises to set — is a
+suggestion, because the browser is under the user's control and `curl` is not
+under yours.
+
+### Long work needs a job, not a long request
+
+HTTP requests are not a place to keep work. Proxies, load balancers and
+browsers all enforce their own timeouts (60 seconds is the common default in
+all three), and none of them know or care that your task is legitimately slow.
+A request that runs longer than the shortest timeout in the chain does not just
+appear to fail — it **loses the completed work**, because that work only ever
+existed in the dying request's memory.
+
+The general rule:
+
+> If a task can outlive a request, give it an id and let the client ask about
+> it.
+
+That single change buys several things at once: the user gets a progress
+indicator instead of a spinner, a dropped connection costs nothing, work
+survives a page refresh, and the server can decide *when* to do the work rather
+than being forced to do it now. It applies to anything slow — video encoding,
+report generation, bulk imports, sending 10,000 emails — not just model
+inference.
+
+It does not require infrastructure. This project's queue is an `asyncio` task
+and a dictionary: no Redis, no Celery, no SQS, no added cost. Reaching for a
+message broker on day one is a common over-correction; the shape matters more
+than the machinery, and the shape is what lets you swap the machinery in later.
+
+### Backpressure is not optimisation, it is survival
+
+Any endpoint that accepts input from outside must decide, *before* spending
+resources, whether it is willing to. The cost of an input is often wildly
+disproportionate to its size — the examples in this codebase being a 6 MB JPEG
+that becomes 100 MB of RAM when decoded, and a 136 KB PNG that declares itself
+to be 144 million pixels.
+
+The pattern that generalises:
+
+- **Bound every unbounded thing.** Request size, item count, concurrency,
+  retention. Anything a caller controls, you cap.
+- **Reject early, before the expensive step.** Checking size *while streaming*
+  means an oversized upload is cut off after a megabyte instead of being
+  received in full and then refused.
+- **Bound resources by concurrency, not by input volume.** Peak memory here is
+  `MAX_CONCURRENCY × ~100 MB` whether you upload 5 files or 5,000. That is the
+  difference between a server that degrades and one that dies.
+- **Validate on the server even when you validate in the browser.** The client
+  check is for the user's benefit — instant feedback, no wasted upload. The
+  server check is the actual rule. Both is not duplication; only the first is
+  negligence.
+
+### Failure must be per-item, not per-batch
+
+When a system processes many things, one bad item must not destroy the run.
+This is why every failure in this pipeline becomes a typed row rather than an
+exception: a batch of 50 cards where 3 are unreadable returns 50 rows, 3 of
+them flagged with a reason.
+
+The generalisation is that **errors are data**. They have a type (`input_error`
+vs `parse_error` vs `model_error`), a message aimed at whoever can act on it,
+and a place in the output. That typing is not bureaucracy — it tells the user
+what to *do*: re-shoot the photo, retry later, or contact someone. "Something
+went wrong" tells them nothing and wastes a support conversation.
+
+The corollary is to **persist progress incrementally**. Results are recorded as
+each card completes, not in one write at the end, so a crash at item 49 keeps
+the first 48.
+
+### Untrusted input includes your own model's output
+
+Input validation is usually framed around what users type. Model output
+deserves exactly the same suspicion, for two different reasons:
+
+- **Structurally**, a model is a probabilistic text generator, not an API. It
+  will eventually return markdown fences, prose, a number where you asked for a
+  string, or a truncated object — so the parser must treat malformed output as
+  an expected case rather than an exception.
+- **Securely**, model output is user input laundered through a model. Text
+  printed on an uploaded card reaches your page having passed through nothing
+  that sanitises it. Rendering it with `innerHTML` is the same vulnerability as
+  rendering a user's comment with `innerHTML`, just with an extra step in
+  between that makes it easier to forget.
+
+The rule that covers both: **treat any value you did not compute yourself as
+hostile until you have constrained it.**
+
+### Determinism belongs in code, not in prompts
+
+Anything with exactly one correct answer should be computed, not generated.
+Phone formatting, date parsing, currency rounding, sorting, deduplication — a
+model can often do these, and will do them slightly differently each time.
+
+Pushing them into code after the model gives you three things a prompt cannot:
+the same answer every run, a stack trace when it is wrong, and a unit test that
+pins the behaviour. Use the model for the part that genuinely needs judgement —
+here, *finding* the phone number on a cluttered card — and let deterministic
+code handle everything downstream of that.
+
+### Configuration is environment, never code
+
+Every value that differs between your laptop, a colleague's machine and
+production belongs in the environment: endpoints, credentials, limits,
+timeouts. The test is simple — **if changing where the app points requires
+editing a file that gets committed, it is hardcoded.**
+
+Here that principle is what makes the migration from local Ollama to a
+llama.cpp instance on AWS a two-variable change rather than a code change. The
+same discipline keeps secrets out of version control, because a value that
+lives in the environment cannot be accidentally committed.
+
+### Seams are cheaper before you need them than after
+
+`store.py` defines an interface and one implementation. Today that interface
+looks like indirection with no payoff — there is exactly one store, and a
+plain dictionary would be shorter.
+
+The payoff is not today. It is that swapping in Postgres touches one file,
+because no route and no worker ever learned that storage was a dictionary. Had
+the routes read a module-level `JOBS = {}` directly, that knowledge would be
+spread across the codebase and the swap would mean touching everything that
+reads it.
+
+The judgement call is **where** to put a seam, because a codebase that is all
+interfaces is worse than one with none. A useful test: put a seam where the
+implementation is *expected to change* (storage, the model backend, the queue)
+and not where it is not. Both seams in this project sit on a boundary the brief
+explicitly said would move.
+
+### Health checks answer one question quickly
+
+`/health` deliberately does not call the model, and `/api/model-check` does.
+The general principle is that a liveness endpoint is polled by machines every
+few seconds and must answer in milliseconds. Making it verify its dependencies
+means a slow dependency makes your healthy process *look* dead — and your
+orchestrator will dutifully kill and restart a container that was working fine,
+turning a downstream slowdown into a restart loop.
+
+Check dependencies on a separate, slower endpoint that humans call
+deliberately.
 
 ---
 
