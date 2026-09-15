@@ -1,0 +1,529 @@
+/* ============================================================================
+   Card Reader — the Industry theme, ported to plain CSS.
+
+   The tokens, names and rules below are lifted from the interview kit's
+   design system (apps/web/src/app/globals.css). That file expresses them as
+   Tailwind v4 @theme variables; this one declares the same values as ordinary
+   custom properties and hand-writes the handful of utilities the kit gets from
+   Tailwind core. Same design, no build step.
+
+   The kit's own rule is obeyed here too: if a value is needed twice, it earns
+   a token at the top rather than being typed into a component.
+   ========================================================================= */
+
+:root {
+  /* — ground —
+     Three surfaces, not one: the workspace ground, a recessed tint, and the
+     white a document sits on so it reads as a document rather than chrome. */
+  --paper:   #f2f2f3;
+  --surface: #ffffff;
+  --ink:     #1d1f20;
+
+  /* Failure and deletion only. Nothing else may use it, so it never has to
+     shout twice. */
+  --alarm:   #ff0000;
+
+  /* — neutral tints —
+     Borders were doing two jobs: separating things, and saying "this is an
+     object". The second job lives here instead, which is why cards below have
+     a fill and no border. */
+  --tint-soft:   #f7f7f8;
+  --tint:        #ebebed;
+  --tint-strong: #e3e3e6;
+  --tint-line:   #dcdce0;
+
+  /* — steel ramp, one shared lightness scale —
+     100–300 tinted fills and hovers · 500 base · 700–900 text on a tint.
+     Paragraph-size accent text is always 700 or darker: 500 on the 100 tint
+     is not readable at body size. */
+  --steel-100: #eaf0f6;
+  --steel-200: #d7e2ed;
+  --steel-300: #b6cadd;
+  --steel-400: #8aa9c6;
+  --steel-500: #5980a6;
+  --steel-600: #4b6c8d;
+  --steel-700: #3d5773;
+  --steel-800: #2f4359;
+  --steel-900: #233343;
+
+  /* — type —
+     Barlow Condensed 600 for titles and interface labels; Barlow 400/500 for
+     everything read. Two families, no exceptions. System stacks follow so the
+     page still works with no network — the AWS box may not have one. */
+  --font-head: "Barlow Condensed", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Barlow", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* — radius —
+     Four steps, each tied to a kind of object rather than a size. The composer
+     is deliberately rounder than a card: it is the one thing on the page you
+     put things into, and the extra 8px is what separates it from the surfaces
+     it sits among. */
+  --radius-control:  10px;
+  --radius-card:     14px;
+  --radius-composer: 22px;
+  --radius-pill:     999px;
+
+  /* — measure —
+     The conversation's width is capped even though its column is fluid: a chat
+     surface that grows to 1400px puts the composer's chips a screen away from
+     its button. */
+  --centre: 46rem;
+  --read:   68ch;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--paper); -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+h1, h2, h3 {
+  margin: 0;
+  font-family: var(--font-head);
+  font-weight: 600;
+  line-height: 1.12;
+  letter-spacing: -0.015em;
+}
+
+/* The system ring: 2px steel, 2px offset. Set once, never restyled per
+   component — which is the whole reason it lives here. */
+:focus-visible { outline: 2px solid var(--steel-500); outline-offset: 2px; }
+::selection { background: var(--steel-200); }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   Objects the kit names: card, tile, and the two states that still earn a frame
+   ------------------------------------------------------------------------ */
+
+.card { border-radius: var(--radius-card); background: var(--tint); }
+.tile { border-radius: 12px; background: var(--tint-soft); }
+
+/* Both of these are claims about the content rather than decoration: this
+   failed, and this is genuinely empty. There are never two side by side. */
+.frame-trouble {
+  border: 1px dashed var(--alarm);
+  border-radius: var(--radius-card);
+  background: transparent;
+}
+.frame-empty {
+  border: 1px dashed color-mix(in srgb, var(--ink) 25%, transparent);
+  border-radius: var(--radius-card);
+  background: transparent;
+}
+
+/* ---------------------------------------------------------------------------
+   Buttons. Pill by default — buttons are the thing you reach for, and the
+   radius is what separates them from the cards they sit on now that neither
+   has a border. Min height 44px on phones, 36 on desktop.
+   ------------------------------------------------------------------------ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 44px;
+  padding: 0 1rem;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--tint);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+@media (min-width: 768px) { .btn { min-height: 36px; } }
+
+.btn:hover:not(:disabled) { background: var(--tint-strong); }
+.btn:active:not(:disabled) { background: var(--tint-line); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn--primary { background: var(--steel-500); color: #fff; }
+.btn--primary:hover:not(:disabled) { background: var(--steel-600); }
+.btn--primary:active:not(:disabled) { background: var(--steel-700); }
+/* A disabled primary must not stay steel — it would read as available. */
+.btn--primary:disabled { background: var(--tint); color: color-mix(in srgb, var(--ink) 40%, transparent); }
+
+.btn--ghost { background: transparent; color: color-mix(in srgb, var(--ink) 55%, transparent); }
+.btn--ghost:hover:not(:disabled) { background: var(--steel-100); color: var(--steel-700); }
+
+.btn--icon {
+  min-height: 0; width: 32px; height: 32px; padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: color-mix(in srgb, var(--ink) 40%, transparent);
+}
+.btn--icon:hover:not(:disabled) { background: var(--steel-100); color: var(--steel-700); }
+
+/* ---------------------------------------------------------------------------
+   Top bar
+   ------------------------------------------------------------------------ */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem clamp(0.75rem, 3vw, 1.5rem);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  /* Frosted rather than solid, so content scrolling under it stays legible as
+     a hint of movement instead of vanishing at a hard edge. */
+  backdrop-filter: blur(8px);
+}
+
+.topbar__name { font-family: var(--font-head); font-size: 1.0625rem; font-weight: 600; }
+
+.topbar__model {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+  padding: 0.25rem 0.6rem;
+  border-radius: var(--radius-pill);
+  background: var(--tint);
+  color: color-mix(in srgb, var(--ink) 60%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+}
+
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--steel-400); }
+.dot.is-up { background: var(--steel-600); }
+.dot.is-down { background: var(--alarm); }
+
+/* The mark: a 15-unit square, per the kit's note — perimeter 60, dash 6+4, so
+   the pattern divides the path exactly six times and the crawl can travel one
+   whole period and start again with no visible seam. */
+.mark { display: block; width: 22px; height: 22px; color: var(--steel-500); }
+.mark rect { fill: none; stroke: currentColor; stroke-width: 2; }
+.mark.is-working rect {
+  stroke-dasharray: 6 4;
+  animation: mark-crawl 1.9s linear infinite;
+}
+@keyframes mark-crawl { to { stroke-dashoffset: -10; } }
+
+/* ---------------------------------------------------------------------------
+   Conversation
+   ------------------------------------------------------------------------ */
+
+.thread {
+  max-width: var(--centre);
+  margin: 0 auto;
+  padding: 1.5rem clamp(0.75rem, 3vw, 1.5rem) 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+/* Steps arrive one at a time; a small rise makes the arrival legible without
+   turning a log into a performance. */
+@keyframes step-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .turn { animation: step-in 260ms ease-out both; }
+}
+
+.turn { display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
+
+/* The user's turn sits right and is the only tinted-steel surface, so the
+   conversation reads as two voices without either being a coloured bubble. */
+.turn--user { align-items: flex-end; }
+
+.turn--user .bubble {
+  max-width: 85%;
+  padding: 0.7rem 0.95rem;
+  border-radius: var(--radius-card);
+  background: var(--steel-100);
+  color: var(--steel-900);
+  font-size: 0.9375rem;
+}
+
+.turn__who {
+  font-family: var(--font-head);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--ink) 40%, transparent);
+}
+
+/* Thumbnails of what was sent. Object-cover so a portrait card still reads. */
+.thumbs { display: flex; flex-wrap: wrap; gap: 0.35rem; justify-content: flex-end; max-width: 85%; }
+.thumbs img {
+  width: 54px; height: 34px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: var(--tint);
+}
+.thumbs .more {
+  display: grid; place-items: center;
+  min-width: 54px; height: 34px; padding: 0 0.4rem;
+  border-radius: 6px;
+  background: var(--tint);
+  color: color-mix(in srgb, var(--ink) 55%, transparent);
+  font-size: 0.75rem; font-weight: 600;
+}
+
+/* ---------------------------------------------------------------------------
+   The assistant's reply
+   ------------------------------------------------------------------------ */
+
+.reply { padding: 0.9rem 1rem 1rem; }
+
+.reply__status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9375rem; }
+
+/* Text still being produced: a gradient clipped to the glyphs rather than a
+   block sliding over them, so the sentence stays readable throughout. Tiled
+   and moved by exactly one tile, and horizontal — an angled gradient cannot
+   tile without a seam down every repeat. */
+.shimmer-text {
+  background-image: linear-gradient(to right,
+    var(--steel-900) 0%, var(--steel-900) 38%,
+    var(--steel-400) 50%,
+    var(--steel-900) 62%, var(--steel-900) 100%);
+  background-size: 13em 100%;
+  background-repeat: repeat-x;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: text-shimmer 2.1s linear infinite;
+}
+@keyframes text-shimmer { to { background-position-x: -13em; } }
+
+/* Reduced motion keeps the identity and drops the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-text {
+    animation: none; background-image: none;
+    color: var(--steel-900); -webkit-text-fill-color: var(--steel-900);
+  }
+  .mark.is-working rect { animation: none; }
+}
+
+.meter { height: 3px; margin: 0.7rem 0 0; border-radius: 999px; background: var(--tint-strong); overflow: hidden; }
+.meter__fill { height: 100%; width: 0; background: var(--steel-500); transition: width 240ms ease; }
+
+.reply__note {
+  margin: 0.55rem 0 0;
+  color: color-mix(in srgb, var(--ink) 55%, transparent);
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+.reply__note.is-trouble { color: var(--alarm); }
+
+.reply__actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.85rem; }
+
+/* ---------------------------------------------------------------------------
+   Leads table, inside the reply
+   ------------------------------------------------------------------------ */
+
+.tablewrap {
+  margin-top: 0.85rem;
+  border-radius: 12px;
+  background: var(--surface);
+  overflow-x: auto;   /* the page body must never scroll sideways */
+}
+
+.leads { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+
+.leads th {
+  position: sticky; top: 0; z-index: 1;
+  padding: 0.5rem 0.7rem;
+  background: var(--surface);
+  color: color-mix(in srgb, var(--ink) 50%, transparent);
+  font-family: var(--font-head);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.leads td {
+  padding: 0.5rem 0.7rem;
+  border-top: 1px solid var(--tint);
+  vertical-align: top;
+}
+
+/* Phone and email in mono: tabular digits make a misparsed E164 number or a
+   wrong domain obvious while scanning fifty rows. Functional, not decorative. */
+.leads .mono { font-family: var(--font-mono); font-size: 0.75rem; white-space: nowrap; }
+.leads .missing { color: color-mix(in srgb, var(--ink) 30%, transparent); }
+
+.leads .source {
+  max-width: 14ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: color-mix(in srgb, var(--ink) 35%, transparent);
+  font-family: var(--font-mono); font-size: 0.6875rem;
+}
+
+/* A flagged row is marked on its leading edge — findable while scrolling
+   without a background colour shouting. Only failure gets the one red. */
+.leads tr.is-flagged td:first-child { box-shadow: inset 3px 0 0 var(--steel-400); }
+.leads tr.is-failed  td:first-child { box-shadow: inset 3px 0 0 var(--alarm); }
+
+.leads .reason {
+  display: block; margin-top: 0.15rem;
+  color: color-mix(in srgb, var(--ink) 50%, transparent);
+  font-size: 0.6875rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Empty state — an invitation to act, not a mood
+   ------------------------------------------------------------------------ */
+
+.blank { padding: 3rem 1.25rem; text-align: center; }
+.blank h2 { font-size: 1.375rem; }
+.blank p {
+  max-width: 34ch; margin: 0.5rem auto 0;
+  color: color-mix(in srgb, var(--ink) 55%, transparent);
+  font-size: 0.9375rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Composer — the one thing on the page you put things into
+   ------------------------------------------------------------------------ */
+
+.dock {
+  position: sticky;
+  bottom: 0;
+  padding: 0.5rem clamp(0.75rem, 3vw, 1.5rem) 1rem;
+  background: linear-gradient(to top, var(--paper) 62%, transparent);
+}
+
+.composer {
+  max-width: var(--centre);
+  margin: 0 auto;
+  padding: 0.75rem 0.85rem 0.7rem;
+  border-radius: var(--radius-composer);
+  background: var(--surface);
+  transition: box-shadow 140ms ease;
+}
+
+/* Focus belongs to the whole composer, not the control inside it: a square
+   outline drawn tight around a borderless input in a 22px card is the one
+   thing that makes the card look like a mistake. */
+.composer.is-focused,
+.composer.is-dragging {
+  box-shadow: 0 0 0 3px var(--steel-200), 0 0 0 4px var(--steel-400);
+}
+
+.composer__prompt {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2rem;
+  color: color-mix(in srgb, var(--ink) 45%, transparent);
+  font-size: 0.9375rem;
+  cursor: pointer;
+}
+
+.composer__prompt strong { color: var(--steel-700); font-weight: 600; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 0.35rem; max-height: 6.5rem; overflow-y: auto; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  max-width: 100%;
+  padding: 0.25rem 0.5rem 0.25rem 0.6rem;
+  border-radius: var(--radius-pill);
+  background: var(--tint-soft);
+  font-size: 0.75rem;
+}
+.chip .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip .size { flex-shrink: 0; color: color-mix(in srgb, var(--ink) 40%, transparent); font-family: var(--font-mono); font-size: 0.6875rem; }
+.chip button {
+  display: grid; place-items: center;
+  width: 16px; height: 16px; padding: 0;
+  border: 0; border-radius: 50%;
+  background: transparent;
+  color: color-mix(in srgb, var(--ink) 35%, transparent);
+  font-size: 13px; line-height: 1; cursor: pointer;
+}
+.chip button:hover { background: var(--tint-strong); color: var(--ink); }
+
+.composer__row { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.55rem; }
+.composer__count {
+  color: color-mix(in srgb, var(--ink) 45%, transparent);
+  font-size: 0.75rem; font-variant-numeric: tabular-nums;
+}
+.composer__row .btn { margin-left: auto; }
+
+.dock__hint {
+  max-width: var(--centre);
+  margin: 0.5rem auto 0;
+  padding: 0 0.85rem;
+  color: color-mix(in srgb, var(--ink) 45%, transparent);
+  font-size: 0.75rem;
+}
+.dock__hint.is-trouble { color: var(--alarm); }
+
+
+/* ---------------------------------------------------------------------------
+   Sign-in gate
+
+   The kit's AuthSplit shape: the object on the left, the form on the right.
+   The split COLLAPSES below lg rather than stacking — on a phone the form is
+   the entire reason the page exists, and a hero above it would push the fields
+   under the fold. Decoration does not get to come first.
+   ------------------------------------------------------------------------ */
+
+.gate {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  background: var(--paper);
+  overflow-y: auto;
+}
+
+@media (min-width: 1024px) {
+  .gate { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+}
+
+.gate__plate { display: none; padding: 2.75rem; background: var(--tint-soft); }
+@media (min-width: 1024px) { .gate__plate { display: block; } }
+
+.gate__eyebrow {
+  margin: 0;
+  font-family: var(--font-head);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--steel-600);
+}
+
+.gate__title { margin-top: 0.4rem; font-size: 2.125rem; }
+
+.gate__beats { max-width: 22rem; margin: 1.75rem 0 0; display: grid; gap: 0.65rem; }
+.gate__beats div { display: flex; align-items: baseline; gap: 0.75rem; font-size: 0.8125rem; }
+.gate__beats dt { margin: 0; font-weight: 500; }
+.gate__beats dd { margin: 0 0 0 auto; text-align: right; color: var(--steel-700); }
+
+.gate__form {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+}
+
+.gate__fallback {
+  max-width: 34ch;
+  text-align: center;
+  color: color-mix(in srgb, var(--ink) 55%, transparent);
+  font-size: 0.875rem;
+}

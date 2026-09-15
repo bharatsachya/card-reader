@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Card Reader</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- Barlow + Barlow Condensed, the kit's two families. A progressive
+     enhancement: the system stacks in app.css take over when there is no
+     network, which the AWS box may well not have. -->
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@600&family=IBM+Plex+Mono:wght@400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<!-- The sign-in gate. Shown until Clerk reports a signed-in user; the app
+     behind it is inert until then. This is presentation only — the server
+     enforces access independently (app/auth.py). -->
+<div class="gate" id="gate" hidden>
+  <div class="gate__plate">
+    <p class="gate__eyebrow">Card Reader</p>
+    <h1 class="gate__title">A stack of cards,<br>a spreadsheet of leads.</h1>
+    <dl class="gate__beats">
+      <div><dt>1 — the photos</dt><dd>drop them in</dd></div>
+      <div><dt>2 — the model reads them</dt><dd>self-hosted, on your box</dd></div>
+      <div><dt>3 — the leads</dt><dd>a table, then .xlsx</dd></div>
+    </dl>
+  </div>
+  <div class="gate__form">
+    <div id="clerk-signin"></div>
+    <p class="gate__fallback" id="gate-fallback" hidden></p>
+  </div>
+</div>
+
+<div id="app" hidden>
+<header class="topbar">
+  <!-- The loading mark: a 15-unit square whose perimeter (60) is an exact
+       multiple of its 6+4 dash pattern, so the crawl loops with no seam. -->
+  <svg class="mark" id="mark" viewBox="0 0 22 22" aria-hidden="true">
+    <rect x="3.5" y="3.5" width="15" height="15" rx="3"></rect>
+  </svg>
+  <span class="topbar__name">Card Reader</span>
+
+  <span class="topbar__model" id="model-badge" aria-live="polite">
+    <span class="dot" id="model-dot"></span>
+    <span id="model-name">checking…</span>
+  </span>
+
+  <!-- Clerk mounts the avatar + account menu here. -->
+  <span id="user-button"></span>
+</header>
+
+<main class="thread" id="thread" aria-live="polite" aria-label="Conversation">
+  <!-- Empty state. An invitation to act, not an apology for having no data. -->
+  <section class="blank" id="blank">
+    <h2>Turn a stack of cards into a spreadsheet</h2>
+    <p>Drop photos of business cards below. Each one is read by the model and
+       comes back as a row you can download.</p>
+  </section>
+</main>
+
+<!-- The composer. Radius 22 — deliberately rounder than a card, because it is
+     the one thing on the page you put something into. -->
+<div class="dock">
+  <div class="composer" id="composer">
+    <input type="file" id="file-input" accept="image/*" multiple hidden>
+
+    <label class="composer__prompt" id="prompt" for="file-input">
+      <span id="prompt-text">Drop business cards here, or <strong>choose files</strong></span>
+    </label>
+
+    <ul class="chips" id="chips" hidden aria-label="Cards ready to send"></ul>
+
+    <div class="composer__row">
+      <span class="composer__count" id="count"></span>
+      <button type="button" class="btn btn--primary" id="send" disabled>Extract leads</button>
+    </div>
+  </div>
+  <p class="dock__hint" id="hint">JPG, PNG, HEIC or WebP · up to 50 files, 15 MB each</p>
+</div>
+
+</div><!-- /#app -->
+
+<script src="/static/auth.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

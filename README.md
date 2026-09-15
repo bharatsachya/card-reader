@@ -1,0 +1,619 @@
+# Card Reader
+
+Extracts structured sales leads from photographs of business cards using a
+self-hosted vision-language model, and exports them as a spreadsheet.
+
+Upload a stack of card photos, each one goes to a Qwen VLM over an
+OpenAI-compatible endpoint, and you get back `first_name`, `last_name`,
+`title`, `company`, `location`, `phone`, `email` — normalised, tabulated, and
+downloadable as `.xlsx`.
+
+---
+
+## Quick start
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+
+# Terminal 1 — a fake model server, so you can run everything with no model
+./.venv/bin/uvicorn tools.stub_model_server:app --port 11434
+
+# Terminal 2 — the app
+./.venv/bin/uvicorn app.main:app --port 8000
+```
+
+Open <http://localhost:8000>, drag `samples/batch/` onto the card, watch it run.
+
+To use a real model instead, point `MODEL_URL` at one (see
+[Model backends](#model-backends)). Nothing else changes.
+
+```bash
+curl -s localhost:8000/health | python3 -m json.tool      # is the app up?
+curl -s localhost:8000/api/model-check                    # is the MODEL up?
+```
+
+---
+
+## Architecture
+
+### The shape of the thing
+
+```
+                          browser (static/)
+                                 │
+                   POST /api/jobs │ multipart, N files
+                                 ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  FastAPI (app/main.py)                                   │
+  │                                                          │
+  │   uploads.py ──► spool each file to DISK, size-checked   │
+  │                  while streaming                         │
+  │        │                                                 │
+  │        ▼         202 Accepted + job_id  ─────────────────┼──►  returns
+  │   jobs.py ─────► background asyncio task                 │     immediately
+  │        │         bounded by a semaphore                  │
+  │        ▼                                                 │
+  │   extraction.py  orchestrates one card:                  │
+  │        │                                                 │
+  │        ├─ 1. imaging.py      EXIF rotate, resize, encode │  deterministic
+  │        ├─ 2. prompt.py       build the messages array    │  deterministic
+  │        ├─ 3. model_client.py HTTP ──────────────────────►│  NON-deterministic
+  │        ├─ 4. parsing.py      text ➜ dict, never raises   │  deterministic
+  │        ├─ 5. postprocess.py  E164 phone, lowercase email │  deterministic
+  │        └─ 6. schema.py       ➜ Lead                      │
+  │                  │                                       │
+  │                  ▼                                       │
+  │   store.py ────► LeadStore (in-memory today)             │
+  │                                                          │
+  │   excel.py ────► GET /api/jobs/{id}/export.xlsx          │
+  └──────────────────────────────────────────────────────────┘
+                                 ▲
+             GET /api/jobs/{id}  │ polled once a second
+```
+
+### Why it is split this way
+
+**The model call is the only non-deterministic step.** Everything before and
+after it is pure, testable code. That boundary is the organising principle of
+the whole codebase:
+
+- `model_client.py` does not know what a `Lead` is. It takes an image data URL
+  and returns the model's raw text. Nothing more.
+- `parsing.py` and `postprocess.py` never touch the network. They are pure
+  functions over strings, which makes every failure mode reproducible in a
+  unit test.
+- Because the boundary is clean, `tools/stub_model_server.py` can stand in for
+  the model and exercise the entire app with zero inference cost — which is how
+  every behaviour documented below was verified.
+
+### The files
+
+| File | Responsibility |
+|---|---|
+| `app/config.py` | Every env-driven setting. The only place model details live. |
+| `app/schema.py` | `Lead` and the canonical `LEAD_FIELDS` tuple. |
+| `app/imaging.py` | EXIF rotation, resize, JPEG re-encode, bomb guard, HEIC. |
+| `app/prompt.py` | The system prompt, generated from `LEAD_FIELDS`. |
+| `app/model_client.py` | HTTP to `/v1/chat/completions`. The only networked module. |
+| `app/parsing.py` | Model text ➜ dict. Never raises. |
+| `app/postprocess.py` | E164 phones, lowercased emails, whitespace. |
+| `app/extraction.py` | Orchestrates one card. Owns the error policy. |
+| `app/uploads.py` | Streams uploads to disk with the size cap enforced mid-stream. |
+| `app/jobs.py` | The background worker and its concurrency semaphore. |
+| `app/store.py` | `LeadStore` interface + in-memory implementation. |
+| `app/excel.py` | `.xlsx` generation. |
+| `app/auth.py` | Clerk session verification against the public JWKS. |
+| `app/main.py` | Routes and static mounting. |
+| `static/index.html` | The chat shell and the sign-in gate. |
+| `static/app.css` | The Industry design system, as plain CSS. No build step. |
+| `static/auth.js` | Clerk integration; wraps `fetch` to attach the token. |
+| `static/app.js` | The conversation, uploads, polling, table, download. |
+| `tools/stub_model_server.py` | Fake model, for development and failure testing. |
+| `tools/make_test_card.py` | Generates the sample cards, including a rotated one. |
+
+---
+
+## Setup
+
+Requires Python 3.11+. Developed and verified on 3.13.
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+cp .env.example .env        # optional; every setting has a default
+```
+
+### Configuration
+
+Everything is an environment variable, and everything has a working default.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MODEL_URL` | `http://localhost:11434/v1/chat/completions` | OpenAI-compatible endpoint |
+| `MODEL_NAME` | `qwen2.5vl:3b` | Model identifier sent in the request body |
+| `MODEL_API_KEY` | *(empty)* | Sent as `Authorization: Bearer` when set |
+| `MODEL_TIMEOUT_SECONDS` | `180` | Per-request timeout |
+| `MODEL_MAX_ATTEMPTS` | `3` | Retries per card on transient failure |
+| `MODEL_RETRY_BASE_SECONDS` | `1` | First backoff wait; doubles each attempt |
+| `MAX_IMAGE_EDGE` | `1024` | Longest edge sent to the model |
+| `MAX_IMAGE_PIXELS` | `89478485` | Decompression-bomb ceiling |
+| `MAX_UPLOAD_BYTES` | `15728640` | 15 MB per file |
+| `MAX_FILES_PER_REQUEST` | `50` | Batch size cap |
+| `MAX_CONCURRENCY` | `1` | Cards in flight at once — **this bounds peak memory** |
+| `MAX_JOBS_RETAINED` | `50` | In-memory job history cap |
+| `DEFAULT_PHONE_REGION` | `IN` | Region assumed for numbers with no country code |
+| `UPLOAD_DIR` | *(system temp)* | Where uploads spool while queued |
+
+### Model backends
+
+The app targets the OpenAI-compatible chat-completions shape, which Ollama,
+llama.cpp, vLLM and OpenAI all speak. Switching backends is two variables.
+
+```bash
+# Ollama (default)
+MODEL_URL=http://localhost:11434/v1/chat/completions
+MODEL_NAME=qwen2.5vl:3b
+
+# llama.cpp llama-server, e.g. a quantized Qwen3-VL-2B on an AWS CPU box
+MODEL_URL=http://10.0.1.23:8080/v1/chat/completions
+MODEL_NAME=Qwen3-VL-2B-Instruct-Q4_K_M
+```
+
+---
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/` | The single-page UI |
+| `GET` | `/health` | Liveness + resolved config. Never calls the model. |
+| `GET` | `/api/auth-config` | Publishable key + whether auth is on. Public by design. |
+| `GET` | `/api/model-check` | Actually calls the model. Slow, by design. |
+| `POST` | `/api/extract` | One image, synchronously. Easiest thing to curl. |
+| `POST` | `/api/jobs` | Bulk upload. Returns `202` + `job_id` immediately. |
+| `GET` | `/api/jobs/{id}` | Poll a job. `?summary=true` omits the leads payload. |
+| `GET` | `/api/jobs` | All jobs, newest first. |
+| `GET` | `/api/jobs/{id}/export.xlsx` | Download. `?only_successful=true` filters. |
+| `GET` | `/api/export.xlsx` | Every lead from every job. |
+
+---
+
+## Libraries, and why each one
+
+| Library | Why this one |
+|---|---|
+| **FastAPI** | Async-native, which matters because this workload is almost entirely *waiting on the model*. Generates OpenAPI docs from type hints for free (`/docs`). |
+| **uvicorn** | The ASGI server FastAPI runs on. |
+| **python-multipart** | Required for FastAPI to parse `multipart/form-data`. Without it, the first `UploadFile` route raises at startup. |
+| **httpx** | An HTTP client with a real `async` API. `requests` is sync-only and would block the event loop on every model call, serialising the whole server. |
+| **Pillow** | EXIF handling, LANCZOS resampling, format conversion. The standard for this. |
+| **pillow-heif** | HEIC decoding. **Not optional** — HEIC is the default iPhone camera format, and Pillow cannot read it alone. Without this, the single most likely real-world input fails. |
+| **openpyxl** | Writes `.xlsx` with formatting, freeze panes and autofilter, with no Excel installed. |
+| **PyJWT[crypto]** | Verifies Clerk session tokens. `[crypto]` pulls in `cryptography` for the RS256 signature check. |
+| **certifi** | Mozilla's CA bundle. Python does not use the OS certificate store, so JWKS fetching fails without it on macOS and slim Linux images. |
+| **phonenumbers** | Google's libphonenumber port. Validates against each country's real numbering plan rather than pattern-matching digits. |
+
+---
+
+## Technical decisions
+
+### 1. Images are resized to 1024px and EXIF-rotated before sending
+
+The highest-leverage code in the project.
+
+**EXIF rotation.** Phone cameras store pixels in the sensor's native landscape
+order and record "rotate 90° when displaying" as a tag. Photo viewers honour
+it, so the image looks upright *to the person who took it* — but a raw decode
+ignores it, and the model receives a sideways card. VLMs are strongly biased
+toward horizontal text; a rotated card typically returns nulls or garbage.
+`ImageOps.exif_transpose()` bakes the rotation into the pixels.
+
+Verified: `samples/card_rotated.jpg` is *stored* 1200×2000 portrait and leaves
+the pipeline as 1024×614 landscape — identical to the upright version.
+
+**Resizing.** A VLM does not "look at" an image; it splits it into patches and
+turns each into a token. Token count scales with **pixel area**, so cost is
+quadratic in edge length:
+
+```
+4032 × 3024 phone photo  = 12.2 M px    ← ~12× the vision tokens
+1024 ×  768 resized      =  0.8 M px
+```
+
+- **Latency:** on a CPU-hosted 2B model, that multiple is seconds versus minutes.
+- **Memory:** vision tokens occupy the KV cache; a large enough image overruns
+  the context window and the request fails outright.
+- **Accuracy does not improve to compensate.** Qwen2.5-VL and Qwen3-VL resize
+  internally to their own supported resolution anyway. Sending 4032px means
+  paying full upload and preprocessing cost to arrive at a similar resolution.
+
+Doing it ourselves with LANCZOS is sharper than a naive server-side resize and
+makes behaviour identical across Ollama, llama.cpp and vLLM.
+
+**Why 1024 and not 512?** Business cards carry ~8pt print. Below roughly 1024
+on the long edge, phone digits blur together and the model misreads or drops
+them. Tunable via `MAX_IMAGE_EDGE` so it can be benchmarked per deployment.
+
+### 2. `temperature 0`
+
+Extraction has exactly one correct answer, so sampling variance is pure
+downside: it makes bugs unreproducible and the same card yield different
+results between runs of the same batch. Greedy decoding gives determinism.
+
+### 3. Portable prompting, not server-side constrained decoding
+
+Ollama's `format`, llama.cpp's GBNF grammars and vLLM's `guided_json` can each
+*guarantee* valid JSON. All three are spelled differently, so depending on one
+would hardcode a server assumption into app logic — the opposite of the
+"nothing model-specific" requirement.
+
+Instead: a strict system prompt, `temperature 0`, and a parser that assumes the
+model will misbehave. The trade is explicit — we accept occasional malformed
+output and handle it, in exchange for backend portability.
+
+### 4. A malformed reply is a flagged row, never a 500
+
+`parsing.py` always returns; it never raises. It tries, in order: strict parse
+→ strip markdown fences → extract the first balanced `{...}` by brace-counting
+(a regex cannot match nested brackets) → repair Python literals and trailing
+commas. Values are coerced to `Optional[str]`, so a phone returned as an int or
+a location returned as a list still lands correctly.
+
+Verified against every observed failure mode:
+
+| Model returns | Result |
+|---|---|
+| clean JSON | `ok` |
+| ```` ```json … ``` ```` fences | `ok`, recovered |
+| prose wrapping the JSON | `ok`, recovered |
+| `{"phone": 9820012345, "location": ["Mumbai","India"]}` | `ok`, coerced |
+| trailing comma, Python `None` | `ok`, repaired |
+| truncated mid-object | `parse_error` + reason |
+| empty reply | `parse_error` + reason |
+| a refusal in prose | `parse_error` + reason |
+| HTTP 500 from the model | `model_error` + reason |
+| model server down | `model_error` + reason |
+| upload is not an image | `input_error` + reason |
+
+All of them return **HTTP 200** with a flagged row.
+
+### 5. Post-processing is code, not prompting
+
+The model reliably *finds* the phone number and unreliably *formats* it. So
+formatting is done deterministically afterwards:
+
+- **Phones → E164** via `phonenumbers`, with `DEFAULT_PHONE_REGION` supplying
+  the country for the domestic numbers most cards print. `is_valid_number()`
+  checks against the real numbering plan, which is what rejects a postcode the
+  model mistook for a phone number. If nothing validates, the model's raw text
+  is kept rather than discarded — a human can still use `ext. 402`.
+- **Emails → lowercased**, `mailto:` stripped, `name (at) company.com`
+  un-obfuscated, trailing punctuation trimmed.
+
+### 6. Bulk upload is a job queue, not a long request
+
+A CPU-hosted 2B VLM takes roughly 10–30s per card, so 50 cards is 15–25
+minutes. No HTTP request survives that: nginx's default `proxy_read_timeout`
+and an AWS ALB's idle timeout are both **60 seconds**, and browsers abandon
+fetches. The connection would die minutes in and every completed result would
+be lost, because it only existed in that request's memory.
+
+So `POST /api/jobs` returns `202` + a `job_id` in milliseconds, a detached
+`asyncio` task does the work, and the client polls. Leads are appended **per
+card**, so the UI fills progressively and a failure at card 49 does not discard
+the first 48.
+
+Deliberately **in-process** — no Redis, no Celery, no SQS. On a single
+instance that adds zero infrastructure and zero cost. Its limits are real and
+listed below.
+
+### 7. Memory is bounded by concurrency, not by batch size
+
+The measured cost of decoding one 4032×3024 photo is **~100 MB RSS** (a JPEG is
+compressed; the decoded RGB buffer is 35 MB, and Pillow holds source, resize
+target and encode buffer at once). Naively, 1000 uploads at once would be ~98 GB.
+
+Three things prevent that:
+
+1. **Uploads stream to disk**, in 1 MB chunks, with the size cap enforced
+   *during* the stream — so an oversized file is aborted after ~1 MB rather
+   than being fully received and then rejected.
+2. **The file is read inside the semaphore**, not before it. All N coroutines
+   are created immediately, but all except `MAX_CONCURRENCY` park on the
+   semaphore costing a few hundred bytes each while their bytes wait on disk.
+3. **Each file is deleted as soon as it is processed**, so a 50-file batch
+   never holds 750 MB of disk for its whole run.
+
+Peak memory is `MAX_CONCURRENCY × ~100 MB` — a constant. Measured RSS after
+processing a 14-image batch: **32 MB**.
+
+`MAX_CONCURRENCY` defaults to **1** because llama.cpp serves one request at a
+time; firing ten at once just queues them while memory climbs. Raise it only
+for a backend with real batching (vLLM on a GPU).
+
+### 8. Backpressure rejects work before it costs anything
+
+- More than `MAX_FILES_PER_REQUEST` → `413`, whole batch refused. A partial
+  success the client did not ask for is worse than a clear rejection.
+- A single file over `MAX_UPLOAD_BYTES` → listed in `rejected[]`, **the rest of
+  the batch still runs**. Someone who dragged in 30 cards and one stray
+  screenshot wants their 29 cards.
+- `MAX_IMAGE_PIXELS` blocks decompression bombs: a 136 KB PNG declaring
+  144 million pixels is rejected before Pillow allocates anything.
+- Client-side checks in `app.js` mirror these limits purely for instant
+  feedback. They are a courtesy, not a control — the server enforces them
+  independently, because anyone can bypass the browser with curl.
+
+### 9. Transient model failures are retried with backoff
+
+llama.cpp briefly refusing connections while it loads, a reset socket, a lost
+race for the single inference slot — these are transient. Turning a one-second
+blip into a permanently blank row, after the user waited twenty minutes for the
+batch, is a bad trade. Three attempts with 1s/2s backoff covers every realistic
+blip; bounding it at three stops a genuinely-dead backend from making a 50-card
+batch take hours to fail.
+
+### 10. Storage is behind an interface, so a database drops in
+
+`store.py` defines `LeadStore` as an abstract base class. `InMemoryLeadStore`
+implements it. `build_store()` is the single place that picks one. Adding
+Postgres means writing `PostgresLeadStore(LeadStore)` and adding one branch to
+`build_store()` — no route, worker or test changes.
+
+Two details make that swap realistic rather than theoretical:
+
+- **Methods are `async`** even though the dict never awaits. A real driver
+  (asyncpg) is async; a sync interface would force rewriting every caller.
+- **The interface is coarse-grained** (`append_lead(job_id, lead)`), so callers
+  cannot reach behind it and the implementation is genuinely free to change.
+
+### 11. Excel details that are easy to get wrong
+
+- **Phone cells are formatted as text (`@`).** Given `+919820012345` in a
+  General cell, Excel "helpfully" reformats it as a number — dropping the `+`
+  and possibly rendering `9.2E+11`. Every carefully-normalised E164 number
+  would arrive mangled.
+- **The workbook is built in a `BytesIO`, never on disk** — no temp filenames
+  to invent, no cleanup, no two requests racing for the same path.
+- **Flagged rows are included and tinted**, with `status` and `error` as the
+  last two columns. A spreadsheet that silently omits 3 of your 14 cards is
+  dangerous: you would never know to re-shoot those three.
+  `?only_successful=true` gives the clean CRM-import file.
+- Freeze panes and an autofilter are one line each and are the difference
+  between a data dump and a spreadsheet someone can work in.
+
+### 12. Model output reaches the DOM through `textContent`
+
+Every table value came from a language model reading a user-supplied image —
+untrusted input twice over. A card printed with `<img src=x onerror=…>` would
+be faithfully extracted and, via `innerHTML`, executed. The renderer builds
+elements individually and assigns `textContent`, which writes text and never
+parses markup.
+
+### 13. The frontend is served by the same process
+
+It is three static files. Hosting them separately (S3/CloudFront/nginx) would
+add cost, a deploy step and CORS configuration in exchange for nothing — the
+app server is idle-waiting on the model anyway. Same-origin also means `fetch`
+needs no CORS headers at all.
+
+---
+
+## Known limitations
+
+### Single-process only
+
+`store.py` holds jobs in a module-level dict, so **running under
+`uvicorn --workers N` is broken**. Each worker is a separate OS process with
+its own memory: worker 1 accepts your upload and creates job `abc123`, your
+next poll round-robins to worker 3, which has never heard of it → `404`. The
+job runs fine; you just cannot see it.
+
+This is acceptable today because the bottleneck is a model that serves one
+request at a time. The fix is the seam in §10 — swap in a shared store and all
+workers see one truth.
+
+### Jobs do not survive a restart
+
+Everything is in memory. A restart loses job history and every extracted lead.
+`MAX_JOBS_RETAINED` (default 50) caps the history so a long-running server does
+not grow until the OOM killer arrives — but that is a leak-limiter, not
+persistence. Same fix: the database seam.
+
+### Auth adds a runtime dependency on Clerk
+
+The sign-in SDK loads from Clerk's CDN and token verification fetches Clerk's
+JWKS, so with auth enabled the app needs outbound internet and stops working if
+Clerk is down. That is a real change from the otherwise self-contained design.
+Setting `CLERK_ISSUER` and `CLERK_PUBLISHABLE_KEY` to blank disables auth and
+restores standalone operation.
+
+The `SESSION_EXPIRED` branch in `app/auth.py` is not covered by the tests run
+here: producing an expired-but-genuinely-Clerk-signed token is not something
+this project can forge. Signature rejection, unknown key ids, malformed tokens
+and missing tokens all are covered.
+
+### No presigned-URL uploads
+
+Bytes go through the app server. For very large batches the correct production
+answer is to have the browser `PUT` directly to S3 and hand the worker a key —
+that removes upload bandwidth, memory and disk from the app server entirely.
+It was deliberately not built: it requires S3, CORS and IAM configuration, and
+it would only speed up the part that *is not the bottleneck*. The model is.
+The worker would still have to download each image to encode it, so the decode
+cost returns; it just moves somewhere concurrency can bound it.
+
+### Accuracy is bounded by the model, and is not measured here
+
+There is no evaluation set and no accuracy number in this README, because
+measuring it properly needs a labelled corpus of real cards. Expect a small
+quantized 2B model to struggle with: heavily stylised or script typefaces,
+low-contrast foil or embossed print, cards photographed at an angle, dual-language
+cards (it may return either language), and deciding which of three printed
+numbers is "the" phone number. `first_name`/`last_name` splitting is also
+culturally naive — it assumes a Western given-name-then-family-name order.
+
+### Phone normalisation falls back to raw text
+
+If `phonenumbers` cannot validate a number, the model's raw string is kept
+rather than dropped. That is deliberate — losing data the model read correctly
+is worse than leaving it unformatted — but it means the phone column is not
+*guaranteed* uniformly E164. Filter on it if you need that guarantee.
+
+### `DEFAULT_PHONE_REGION` is global
+
+One region for the whole deployment. A batch mixing Indian and German cards
+normalises correctly only where the card printed a `+country` prefix, which
+most international cards do but most domestic ones do not.
+
+### The job queue is in-process
+
+No retry of an entire failed job, no cancellation, no cross-instance
+distribution, no durability. A crash mid-batch loses the remaining work (though
+leads already extracted are retained, because they are appended per card).
+
+### Python version
+
+Written against 3.11+; developed and verified on 3.13. No 3.13-only syntax is
+used.
+
+---
+
+## Authentication
+
+Sign-in is [Clerk](https://clerk.com), integrated **without React and without a
+build step** — Clerk publishes `@clerk/clerk-js`, a plain browser bundle that
+exposes a global `Clerk` object.
+
+### The rule this is built around
+
+> The API verifies the token itself. It never trusts a header because the
+> frontend promises to have set one.
+
+An API that believes `X-User-Id` because its own frontend sets it is not
+authenticated — it is authenticated only to people who use the frontend, and
+anyone with curl can send any header they like. So the browser sends Clerk's
+signed session JWT and `app/auth.py` checks that signature against Clerk's
+published public keys.
+
+How the check works:
+
+1. Clerk signs each session token with a private key only Clerk holds.
+2. The matching **public** key is published at `<issuer>/.well-known/jwks.json`.
+3. We fetch it (cached by `PyJWKClient`, refetched on an unknown key id, which
+   makes Clerk's key rotation transparent) and verify the signature.
+4. We also check `exp` and `iss` — the latter so a token minted by some *other*
+   Clerk tenant an attacker controls is rejected.
+
+### The secret key is not used
+
+Verification needs public keys only. `CLERK_SECRET_KEY` appears nowhere in this
+codebase and is never read. The process holds no credential that could act on
+the Clerk account.
+
+### Verified behaviour
+
+| Request | Result |
+|---|---|
+| No `Authorization` header | `401 UNAUTHENTICATED` |
+| Malformed token | `401` — invalid header padding |
+| Self-signed HS256 token | `401` — no matching signing key |
+| **RS256 token carrying Clerk's real key id, signed with a different key** | **`401` — signature verification failed** |
+| Job id belonging to another user | `404`, not `403` |
+
+That last row is deliberate. A `403` would confirm the id exists, letting an
+attacker enumerate valid job ids. `404` tells them nothing they did not already
+know, and is the same response they would get for a nonexistent job.
+
+### TLS, and a bug worth knowing about
+
+Python does **not** use the operating system's certificate store. A python.org
+install on macOS ships with no CA bundle until you run
+`Install Certificates.command`, and minimal Linux containers often have none.
+
+The symptom is badly misleading: fetching the JWKS fails with
+`CERTIFICATE_VERIFY_FAILED`, which surfaces as "could not resolve signing key"
+— so *every* token appears invalid, including genuine ones, and it reads like
+an auth bug rather than a TLS one. `app/auth.py` therefore builds its SSL
+context explicitly from `certifi`.
+
+What it does **not** do is disable verification. Turning certificate checking
+off to make the error go away would let anyone who can intercept the connection
+serve their own JWKS — their own public keys — and every token they forged
+would verify. That converts the whole file from a security control into
+decoration.
+
+### Data is scoped per user
+
+Jobs carry a `user_id`. Every read checks ownership, and `list_jobs` /
+`all_leads` filter by it. In the in-memory store that is a field comparison; in
+a database it becomes `WHERE user_id = ?` — the same shape, which is the point
+of the storage seam.
+
+### Running without Clerk
+
+Leave `CLERK_ISSUER` and `CLERK_PUBLISHABLE_KEY` blank and auth disables
+itself: `require_user` returns a fixed local user and every route works
+unauthenticated. This keeps `curl localhost:8000` usable for development and
+keeps the project runnable by someone who has no Clerk account.
+
+---
+
+## Design
+
+The interface uses the **Industry** design system from the sibling
+`trao-interview-kit` project, ported from Tailwind v4 `@theme` variables to
+plain CSS custom properties. Same tokens, same rules, no build step:
+
+- three surfaces (`--paper`, `--surface`, plus tints) rather than one
+- one steel accent ramp on a shared lightness scale
+- one red (`--alarm`), spent on failure and deletion only
+- cards are **tinted fills with no border** — borders were doing two jobs, and
+  "this is an object" moved to the fill
+- Barlow Condensed 600 for titles, Barlow 400/500 for everything read
+- four radius steps tied to *kinds of object*: control 10, card 14,
+  **composer 22**, pill 999
+
+The composer is deliberately rounder than a card because it is the one thing on
+the page you put something into, and focus rings the whole composer rather than
+the control inside it — a square outline drawn tight around a borderless input
+inside a 22px card is the one thing that makes the card look like a mistake.
+
+The page is a **conversation**: each upload becomes a user turn with
+thumbnails, and the assistant replies with a shimmering status line, a progress
+meter, the leads table, and download buttons. The API underneath is unchanged
+— the chat is how results are *presented*, not a different protocol.
+
+---
+
+## Testing without a model
+
+`tools/stub_model_server.py` implements the same `/v1/chat/completions`
+contract and can reproduce each misbehaviour on demand — which is how the
+failure table in §4 was verified.
+
+```bash
+STUB_MODE=fenced   ./.venv/bin/uvicorn tools.stub_model_server:app --port 11434
+```
+
+| `STUB_MODE` | Simulates |
+|---|---|
+| `clean` *(default)* | Well-formed JSON |
+| `mixed` | A rotating mix of good and bad replies, with varied people |
+| `fenced` | JSON wrapped in markdown fences |
+| `prose` | JSON buried in conversational text |
+| `weird_types` | `phone` as an int, `location` as a list, `"N/A"` strings |
+| `malformed` | Trailing comma and Python `None` |
+| `truncated` | Reply cut off mid-object |
+| `empty` | Empty string |
+| `refusal` | "I'm sorry, I can't read this image." |
+| `http500` | Upstream error |
+| `slow` | Never replies — exercises the timeout path |
+
+`STUB_DELAY=1.5` adds artificial latency so the job queue's progress behaviour
+is observable.
+
+```bash
+./.venv/bin/python tools/make_test_card.py   # regenerate sample cards
+```

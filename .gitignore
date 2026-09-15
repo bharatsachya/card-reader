@@ -1,0 +1,18 @@
+# Virtualenv
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Secrets and local configuration. .env.example is committed; .env is not.
+.env
+.env.local
+
+# Generated test images — regenerate with: python tools/make_test_card.py
+# The two originals are kept so the project is runnable immediately; the
+# batch/ copies are just duplicates and would bloat the history.
+samples/batch/
+
+# macOS
+.DS_Store

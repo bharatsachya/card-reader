@@ -1,0 +1,33 @@
+# Pinned so `pip install -r requirements.txt` reproduces this exact environment.
+# Versions are what was resolved on Python 3.13; all support 3.11+.
+
+# --- Web framework + ASGI server ---
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+# Required by FastAPI to parse multipart/form-data, i.e. file uploads.
+# FastAPI raises a RuntimeError on the first UploadFile route without it.
+python-multipart==0.0.32
+
+# --- HTTP client for the model's OpenAI-compatible endpoint ---
+httpx==0.28.1
+
+# --- Image preprocessing: EXIF rotation, resize, re-encode ---
+pillow==12.3.0
+# HEIC/HEIF decoding. Not optional: HEIC is the default iPhone camera format,
+# and Pillow cannot read it on its own.
+pillow-heif==1.7.0
+
+# --- .xlsx generation ---
+openpyxl==3.1.5
+
+# --- Deterministic phone parsing / E164 formatting ---
+phonenumbers==9.0.39
+
+# --- Authentication: verifying Clerk session tokens ---
+# PyJWT does the JWT work; [crypto] pulls in `cryptography` for the RS256
+# signature check. Only PUBLIC keys are used -- see app/auth.py.
+PyJWT[crypto]==2.14.0
+# Mozilla's CA bundle. Imported directly because Python does not use the OS
+# certificate store, so JWKS fetching fails without it on macOS and on slim
+# Linux images.
+certifi==2026.7.22
