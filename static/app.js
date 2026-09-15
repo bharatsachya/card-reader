@@ -518,6 +518,90 @@ window.addEventListener('pagehide', () => {
   objectUrls.forEach((url) => URL.revokeObjectURL(url));
 });
 
+/* ---------- the sign-in screen ------------------------------------------- */
+
+/**
+ * Put a usable sign-in in front of the user, whatever Clerk manages to do.
+ *
+ * Three levels, in order of preference:
+ *   1. Clerk's embedded form, mounted into the page.
+ *   2. Clerk's modal, opened by our own button — works even when the embedded
+ *      component does not render.
+ *   3. A link to Clerk's hosted Account Portal, which needs no local rendering
+ *      at all and only fails if Clerk itself is unreachable.
+ *
+ * The reason for the ladder: mountSignIn() can return WITHOUT THROWING and
+ * still render nothing (a blocked request, a component bundle that failed to
+ * lazy-load, an instance that is not configured for embedded components). A
+ * try/catch cannot see that. So instead of trusting it, we check whether it
+ * actually put anything on the page and fall back if it did not.
+ */
+async function presentSignIn(auth) {
+  const container = el('clerk-signin');
+  const actions = el('gate-actions');
+  const fallback = el('gate-fallback');
+
+  const revealButtons = (message, isTrouble) => {
+    actions.hidden = false;
+    if (message) {
+      fallback.textContent = message;
+      fallback.classList.toggle('is-trouble', Boolean(isTrouble));
+    }
+  };
+
+  el('gate-signin').addEventListener('click', () => openClerk(auth, 'signIn'));
+  el('gate-signup').addEventListener('click', () => openClerk(auth, 'signUp'));
+
+  try {
+    auth.clerk.mountSignIn(container);
+  } catch (error) {
+    revealButtons(`Embedded form unavailable (${error.message}). Use the buttons above.`, true);
+    return;
+  }
+
+  /* Give the component a beat to render, then verify it actually did.
+     Mounting is asynchronous inside Clerk, so checking immediately would
+     always report empty. */
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+
+  if (container.childElementCount === 0) {
+    revealButtons(
+      'The embedded sign-in form did not render, so here are buttons that ' +
+      'open Clerk directly. If neither works, check the browser console for ' +
+      'a Clerk error.',
+      false,
+    );
+  }
+}
+
+/** Open Clerk's modal, or fall back to its hosted page. */
+function openClerk(auth, which) {
+  const fallback = el('gate-fallback');
+  try {
+    if (which === 'signUp' && auth.clerk.openSignUp) {
+      auth.clerk.openSignUp({});
+      return;
+    }
+    if (auth.clerk.openSignIn) {
+      auth.clerk.openSignIn({});
+      return;
+    }
+    throw new Error('Clerk exposes no modal on this build');
+  } catch (error) {
+    /* Last resort: Clerk's hosted Account Portal. `redirect_url` brings the
+       user back here once they are signed in. */
+    const host = auth.accountsHost;
+    if (!host) {
+      fallback.textContent = `Could not open sign-in: ${error.message}`;
+      fallback.classList.add('is-trouble');
+      return;
+    }
+    const back = encodeURIComponent(window.location.origin);
+    const path = which === 'signUp' ? 'sign-up' : 'sign-in';
+    window.location.href = `https://${host}/${path}?redirect_url=${back}`;
+  }
+}
+
 /* ---------- boot --------------------------------------------------------- */
 
 /* Nothing renders until we know whether there is a user. Showing the app and
@@ -538,17 +622,13 @@ async function boot() {
     appRoot.hidden = false;
   } else if (!auth.user) {
     showGate();
-    try {
-      auth.clerk.mountSignIn(el('clerk-signin'));
-    } catch (error) {
-      const fallback = el('gate-fallback');
-      fallback.hidden = false;
-      fallback.textContent = `Sign-in could not load: ${error.message}`;
-    }
+    await presentSignIn(auth);
     /* Clerk fires this whenever the session changes. Reloading after sign-in
        is the simplest correct thing: it re-runs boot() with a live session
        rather than trying to hot-swap the page's state. */
-    auth.clerk.addListener(({ user }) => { if (user) window.location.reload(); });
+    try {
+      auth.clerk.addListener(({ user }) => { if (user) window.location.reload(); });
+    } catch { /* listener is a nicety; the reload below still covers us */ }
     return;   // the app stays inert until there is a user
   } else {
     gate.hidden = true;

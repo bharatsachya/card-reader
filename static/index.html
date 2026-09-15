@@ -28,8 +28,23 @@
     </dl>
   </div>
   <div class="gate__form">
-    <div id="clerk-signin"></div>
-    <p class="gate__fallback" id="gate-fallback" hidden></p>
+    <div class="gate__card">
+      <!-- Clerk renders its embedded form here when it can. -->
+      <div id="clerk-signin"></div>
+
+      <!-- Real controls that do NOT depend on the embedded form rendering.
+           A sign-in screen whose only affordance is a third-party component
+           mounting successfully has no way to fail visibly. These appear
+           whenever the embedded form does not. -->
+      <div class="gate__actions" id="gate-actions" hidden>
+        <h2 class="gate__heading">Sign in to continue</h2>
+        <p class="gate__sub">Leads are stored per account, so cards you upload
+           stay yours.</p>
+        <button type="button" class="btn btn--primary" id="gate-signin">Sign in</button>
+        <button type="button" class="btn" id="gate-signup">Create an account</button>
+        <p class="gate__fallback" id="gate-fallback"></p>
+      </div>
+    </div>
   </div>
 </div>
 

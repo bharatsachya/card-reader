@@ -527,3 +527,20 @@ h1, h2, h3 {
   color: color-mix(in srgb, var(--ink) 55%, transparent);
   font-size: 0.875rem;
 }
+
+.gate__card { width: 100%; max-width: 25rem; }
+
+.gate__actions { display: flex; flex-direction: column; gap: 0.6rem; align-items: stretch; }
+.gate__heading { font-size: 1.375rem; }
+.gate__sub {
+  margin: -0.15rem 0 0.6rem;
+  color: color-mix(in srgb, var(--ink) 55%, transparent);
+  font-size: 0.875rem;
+}
+.gate__fallback {
+  margin: 0.4rem 0 0;
+  color: color-mix(in srgb, var(--ink) 50%, transparent);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+.gate__fallback.is-trouble { color: var(--alarm); }

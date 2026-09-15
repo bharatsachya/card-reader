@@ -80,6 +80,11 @@ async function initAuth() {
   return {
     enabled: true,
     clerk: window.Clerk,
+    /* Clerk's hosted Account Portal lives on the same subdomain with
+       ".clerk" removed: bursting-turkey-6056.clerk.accounts.dev becomes
+       bursting-turkey-6056.accounts.dev. Used only as a last resort, when
+       neither the embedded form nor the modal works. */
+    accountsHost: host.replace('.clerk.accounts.dev', '.accounts.dev'),
     get user() { return window.Clerk.user; },
     /**
      * A short-lived session JWT for the Authorization header.
