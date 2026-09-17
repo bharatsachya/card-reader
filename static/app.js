@@ -318,6 +318,14 @@ sendBtn.addEventListener('click', async () => {
     reply.note.classList.add('is-trouble');
   }
 
+  liveJobId = data.job_id;
+  liveReply = reply;
+  openJobId = data.job_id;
+  /* Refreshed now, not when the job finishes, so the run appears in the
+     sidebar the moment it starts -- a history panel that only shows completed
+     work is useless during the 25 minutes you most want to look at it. */
+  loadRuns();
+
   startPolling(data.job_id, data.accepted, reply);
 });
 
@@ -351,6 +359,10 @@ async function poll(reply) {
     const job = await response.json();
 
     renderTable(reply, job.leads);
+    /* Repainted from the poll response we already have rather than by
+       re-fetching /api/jobs: the progress numbers are right there, and a
+       second request per second per tab is pure waste. */
+    refreshRunningRow(job);
     const pct = job.total ? Math.round((job.processed / job.total) * 100) : 0;
     reply.fill.style.width = `${pct}%`;
 
@@ -371,12 +383,29 @@ async function poll(reply) {
   pollTimer = setTimeout(() => poll(reply), POLL_INTERVAL_MS);
 }
 
+/**
+ * Stop polling and present the finished job.
+ *
+ * SPLIT IN TWO ON PURPOSE. Opening a run from the history sidebar needs the
+ * presentation half and must NOT have the teardown half: a history view that
+ * called this wholesale would clear pollTimer and silently kill a job that is
+ * still running in another turn. The bug would look like "long batches
+ * randomly stop updating", and nothing in the sidebar code would point at it.
+ */
 function finishReply(reply, job) {
   clearTimeout(pollTimer);
   pollTimer = null;
+  liveJobId = null;
+  liveReply = null;
   setWorking(false);
   sendBtn.disabled = chosen.length === 0;
 
+  paintReplyOutcome(reply, job);
+  loadRuns();          /* the run just moved from "running" to a final state */
+}
+
+/** The presentational half: safe to call for any job, live or historical. */
+function paintReplyOutcome(reply, job) {
   reply.statusText.classList.remove('shimmer-text');
   reply.meter.classList.add('is-done');
 
@@ -467,14 +496,30 @@ function renderTable(reply, leads) {
     reply.card.insertBefore(wrap, reply.actions);
   }
 
+  /* The set the lightbox arrows walk through is whatever this table shows,
+     so opening a card from a history view navigates that run, not the live one. */
+  reply.card.__leads = leads;
+
   const tbody = wrap.querySelector('tbody');
   /* Rebuilding the whole tbody each poll is fine at these sizes (tens to low
      hundreds of rows) and removes a class of diffing bugs. For thousands of
      rows the fix is to append only what is new. */
   tbody.replaceChildren();
 
-  for (const lead of leads) {
+  leads.forEach((lead, rowIndex) => {
     const tr = document.createElement('tr');
+    /* A row is a button in spirit, so give it the affordances of one: a tab
+       stop, a role, and Enter/Space. Making the whole row clickable without
+       this leaves every keyboard user unable to open a card at all. */
+    tr.tabIndex = 0;
+    tr.setAttribute('role', 'button');
+    tr.setAttribute('aria-label',
+      `View ${[lead.first_name, lead.last_name].filter(Boolean).join(' ') || lead.source_filename || 'card'}`);
+    const open = () => openLightbox(reply.card.__leads || leads, rowIndex);
+    tr.addEventListener('click', open);
+    tr.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
+    });
     if (lead.status === 'model_error' || lead.status === 'input_error') {
       tr.classList.add('is-failed');
     } else if (lead.status !== 'ok') {
@@ -514,7 +559,7 @@ function renderTable(reply, leads) {
     tr.append(source);
 
     tbody.append(tr);
-  }
+  });
 }
 
 /* Blob URLs for thumbnails hold the whole file in memory until revoked. */
@@ -787,6 +832,404 @@ async function boot() {
 
   loadModelBadge();
   renderChips();
+
+  /* Who is signed in, in the sidebar. Only meaningful under AUTH_MODE=clerk;
+     in local mode there is one fixed user and naming them would imply an
+     account boundary that does not exist. */
+  if (auth.enabled && auth.user) {
+    sidebarWho.textContent =
+      auth.user.primaryEmailAddress?.emailAddress || auth.user.username || 'Signed in';
+    sidebarWho.hidden = false;
+  }
+
+  loadRuns();
 }
 
 boot();
+
+/* ============================================================================
+   Card images
+
+   WHY THESE ARE NOT JUST <img src="/api/leads/{id}/image">.
+
+   Every API call goes through api(), which attaches the Clerk session token as
+   an Authorization header. An <img> tag cannot do that — the browser issues
+   that request itself, and there is no way to add a header to it. So the
+   moment AUTH_MODE=clerk, every thumbnail and every lightbox image would come
+   back 401 while the rest of the page worked perfectly. The alternatives are
+   worse: a token in the query string lands in logs and Referer headers, and a
+   cookie would need CSRF protection the API does not otherwise require.
+
+   So the bytes are fetched like any other authenticated resource and handed to
+   the <img> as a blob URL. This costs nothing in bandwidth: the response still
+   carries `private, max-age=31536000, immutable`, so a second fetch of the same
+   URL is served from the browser's HTTP cache without touching the network.
+
+   The Map is a SECOND cache in front of that, holding the blob URL itself.
+   Without it, reopening the lightbox would allocate a new blob for bytes
+   already in memory, and every allocation leaks until the page unloads —
+   blob URLs are not garbage collected while a URL string exists.
+   ========================================================================= */
+
+const imageCache = new Map();     // lead_id -> blob URL
+const imageFailed = new Set();    // lead_ids known to 404, so we stop asking
+
+async function leadImageUrl(leadId) {
+  if (!leadId || imageFailed.has(leadId)) return null;
+  if (imageCache.has(leadId)) return imageCache.get(leadId);
+
+  try {
+    const response = await api(`/api/leads/${encodeURIComponent(leadId)}/image`);
+    if (!response.ok) {
+      /* 404 is an ordinary outcome, not a failure: retention deletes images on
+         purpose, and /api/extract never stores one. Remember it so a sidebar
+         that re-renders on every poll does not re-request a known-absent
+         image once per second. */
+      imageFailed.add(leadId);
+      return null;
+    }
+    const url = URL.createObjectURL(await response.blob());
+    imageCache.set(leadId, url);
+    objectUrls.push(url);
+    return url;
+  } catch {
+    imageFailed.add(leadId);
+    return null;
+  }
+}
+
+/** Point an <img> at a lead's image once it arrives. Safe if it never does. */
+async function fillImage(img, leadId) {
+  const url = await leadImageUrl(leadId);
+  if (url) img.src = url;
+  else img.closest('.run__thumbs, .lightbox__stage')?.classList.add('is-empty');
+}
+
+/* ============================================================================
+   Run history sidebar
+   ========================================================================= */
+
+const sidebar     = el('sidebar');
+const runsList    = el('runs');
+const runsEmpty   = el('runs-empty');
+const runsMore    = el('runs-more');
+const scrim       = el('scrim');
+const sidebarWho  = el('sidebar-who');
+
+let nextCursor = null;      // pagination cursor; null = no more pages
+let openJobId = null;       // which run the main panel is showing
+let liveJobId = null;       // the job currently being polled, if any
+let liveReply = null;       // its assistant-turn handles, so we can scroll to it
+
+/** Relative time, because "3 minutes ago" is what a history list is scanned for. */
+function relativeTime(iso) {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const seconds = Math.max(0, (Date.now() - then) / 1000);
+  if (seconds < 60)    return 'just now';
+  if (seconds < 3600)  return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
+  if (seconds < 604800) return `${Math.floor(seconds / 86400)} d ago`;
+  return new Date(then).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function buildRunRow(job) {
+  const li = document.createElement('li');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'run';
+  button.dataset.jobId = job.job_id;
+  if (job.job_id === openJobId) button.classList.add('is-active');
+
+  const top = document.createElement('div');
+  top.className = 'run__top';
+  const when = document.createElement('span');
+  when.className = 'run__when';
+  when.textContent = relativeTime(job.created_at);
+  const count = document.createElement('span');
+  count.className = 'run__count';
+  count.textContent = plural(job.total, 'card');
+  top.append(when, count);
+
+  const stats = document.createElement('div');
+  stats.className = 'run__stats';
+  stats.dataset.role = 'stats';
+  paintStats(stats, job);
+
+  const thumbs = document.createElement('div');
+  thumbs.className = 'run__thumbs';
+  (job.thumbnails || []).forEach((leadId) => {
+    const img = document.createElement('img');
+    img.alt = '';                 // decorative; the counts carry the meaning
+    img.loading = 'lazy';
+    thumbs.append(img);
+    fillImage(img, leadId);
+  });
+
+  button.append(top, stats, thumbs);
+  button.addEventListener('click', () => openRun(job.job_id));
+  li.append(button);
+  return li;
+}
+
+/** The success/failure line, split out so a poll can repaint it in place. */
+function paintStats(node, job) {
+  node.replaceChildren();
+  if (job.status === 'running' || job.status === 'queued') {
+    const live = document.createElement('span');
+    live.className = 'run__live shimmer-text';
+    live.textContent = `${job.processed}/${job.total}`;
+    node.append(live);
+    return;
+  }
+  const ok = document.createElement('span');
+  ok.textContent = `${job.succeeded} read`;
+  node.append(ok);
+  if (job.failed) {
+    const bad = document.createElement('span');
+    bad.className = 'bad';
+    bad.textContent = `${job.failed} flagged`;
+    node.append(bad);
+  }
+}
+
+async function loadRuns({ append = false } = {}) {
+  const query = append && nextCursor ? `?cursor=${encodeURIComponent(nextCursor)}` : '';
+  let data;
+  try {
+    const response = await api(`/api/jobs${query}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    data = await response.json();
+  } catch {
+    /* A history panel that cannot load is not worth interrupting the app for —
+       the user came here to extract cards, and that still works. */
+    return;
+  }
+
+  if (!append) runsList.replaceChildren();
+  data.jobs.forEach((job) => runsList.append(buildRunRow(job)));
+
+  nextCursor = data.next_cursor;
+  runsMore.hidden = !nextCursor;
+  runsEmpty.hidden = runsList.children.length > 0;
+}
+
+/** Patch the running job's row from poll data — no extra request. */
+function refreshRunningRow(job) {
+  const row = runsList.querySelector(`.run[data-job-id="${job.job_id}"]`);
+  if (!row) return;
+  const stats = row.querySelector('[data-role="stats"]');
+  if (stats) paintStats(stats, job);
+}
+
+/**
+ * Show one run in the main panel.
+ *
+ * Deliberately routed through addAssistantTurn() + renderTable() + the same
+ * finishing code a live job uses, rather than a second "history view"
+ * component. Two renderers for one table is how the two drift: a fix to the
+ * flagged-row tint or the textContent discipline lands in one and not the
+ * other, and the one that silently keeps the old behaviour is the security-
+ * relevant one.
+ */
+async function openRun(jobId) {
+  closeSidebarOnNarrow();
+
+  if (jobId === liveJobId && liveReply) {
+    /* The running job is already on screen and updating itself. Re-rendering
+       it would throw away the live handles the poll is writing into. */
+    openJobId = jobId;
+    markActiveRun();
+    liveReply.card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return;
+  }
+
+  let job;
+  try {
+    const response = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    job = await response.json();
+  } catch (error) {
+    setHint(`Could not open that run: ${error.message}`, true);
+    return;
+  }
+
+  openJobId = jobId;
+  markActiveRun();
+
+  blank.hidden = true;
+  thread.replaceChildren();          /* a history view replaces the transcript */
+  liveReply = null;
+
+  const reply = addAssistantTurn();
+  reply.meter.remove();              /* nothing is in progress to meter */
+  paintReplyOutcome(reply, job);     /* NOT finishReply -- see its docstring */
+  renderTable(reply, job.leads);
+}
+
+function markActiveRun() {
+  runsList.querySelectorAll('.run').forEach((node) => {
+    node.classList.toggle('is-active', node.dataset.jobId === openJobId);
+  });
+}
+
+/* ---------- sidebar open/close (narrow screens only) --------------------- */
+
+function openSidebar() {
+  sidebar.classList.add('is-open');
+  scrim.hidden = false;
+  el('sidebar-toggle').setAttribute('aria-expanded', 'true');
+}
+function closeSidebar() {
+  sidebar.classList.remove('is-open');
+  scrim.hidden = true;
+  el('sidebar-toggle').setAttribute('aria-expanded', 'false');
+}
+/* On a wide screen the panel is permanent, so "close after clicking" would be
+   a jarring no-op. matchMedia keeps that rule in one place rather than
+   duplicating the 60rem breakpoint as a magic number in several handlers. */
+const wideScreen = window.matchMedia('(min-width: 60rem)');
+function closeSidebarOnNarrow() { if (!wideScreen.matches) closeSidebar(); }
+
+el('sidebar-toggle').addEventListener('click', () =>
+  sidebar.classList.contains('is-open') ? closeSidebar() : openSidebar());
+el('sidebar-close').addEventListener('click', closeSidebar);
+scrim.addEventListener('click', closeSidebar);
+runsMore.addEventListener('click', () => loadRuns({ append: true }));
+
+/* ============================================================================
+   Lightbox
+   ========================================================================= */
+
+const lightbox   = el('lightbox');
+const lbImage    = el('lb-image');
+const lbFields   = el('lb-fields');
+const lbTitle    = el('lightbox-title');
+const lbCount    = el('lb-count');
+const lbFlag     = el('lb-flag');
+const lbPrev     = el('lb-prev');
+const lbNext     = el('lb-next');
+
+let currentLeads = [];        // the set the arrows move through
+let lbIndex = 0;
+let lastFocused = null;       // restored on close
+
+function openLightbox(leads, index) {
+  if (!leads.length) return;
+  currentLeads = leads;
+  lbIndex = Math.max(0, Math.min(index, leads.length - 1));
+
+  /* Remembered BEFORE focus moves. Returning focus to where it came from is
+     what stops a keyboard user being dumped at the top of the document every
+     time they close a card — the single most common way a modal breaks
+     keyboard navigation. */
+  lastFocused = document.activeElement;
+
+  lightbox.hidden = false;
+  /* The background must not scroll under the overlay. Set here rather than in
+     CSS so it is unmistakably paired with the reset in closeLightbox(). */
+  document.body.style.overflow = 'hidden';
+  paintLightbox();
+  el('lb-close').focus();
+}
+
+function closeLightbox() {
+  lightbox.hidden = true;
+  document.body.style.overflow = '';
+  lbImage.removeAttribute('src');
+  if (lastFocused && document.contains(lastFocused)) lastFocused.focus();
+  lastFocused = null;
+}
+
+function paintLightbox() {
+  const lead = currentLeads[lbIndex];
+  if (!lead) return;
+
+  const name = [lead.first_name, lead.last_name].filter(Boolean).join(' ');
+  lbTitle.textContent = name || lead.source_filename || 'Card';
+  lbCount.textContent = `${lbIndex + 1} of ${currentLeads.length} · ${lead.source_filename || ''}`;
+
+  if (lead.status !== 'ok' && lead.error) {
+    lbFlag.textContent = lead.error;      // model/server text → textContent
+    lbFlag.hidden = false;
+  } else {
+    lbFlag.hidden = true;
+  }
+
+  /* Cleared before the fetch resolves, so an arrow press never leaves the
+     PREVIOUS card's photograph sitting next to THIS card's fields — which
+     would be a convincing, silent lie about what the model read. */
+  lbImage.removeAttribute('src');
+  lbImage.alt = name ? `Business card for ${name}` : 'Business card';
+  const requested = lbIndex;
+  leadImageUrl(lead.id).then((url) => {
+    if (url && requested === lbIndex) lbImage.src = url;   // ignore a stale response
+  });
+
+  lbFields.replaceChildren();
+  COLUMNS.forEach((column, i) => {
+    const dt = document.createElement('dt');
+    dt.textContent = HEADINGS[i];
+    const dd = document.createElement('dd');
+    const value = lead[column];
+    dd.textContent = value || '—';                // model output → textContent
+    if (!value) dd.className = 'missing';
+    else if (MONO.has(column)) dd.className = 'mono';
+    lbFields.append(dt, dd);
+  });
+
+  lbPrev.disabled = lbIndex === 0;
+  lbNext.disabled = lbIndex === currentLeads.length - 1;
+}
+
+function moveLightbox(step) {
+  const next = lbIndex + step;
+  if (next < 0 || next >= currentLeads.length) return;
+  lbIndex = next;
+  paintLightbox();
+}
+
+lbPrev.addEventListener('click', () => moveLightbox(-1));
+lbNext.addEventListener('click', () => moveLightbox(1));
+el('lb-close').addEventListener('click', closeLightbox);
+
+/* Click-outside. The check is "did the click land on the backdrop itself",
+   not "was it outside the panel" — a click that STARTS inside the panel and
+   drags out (selecting text, or a sloppy tap) would otherwise close the
+   dialog and lose the selection. */
+lightbox.addEventListener('mousedown', (event) => {
+  if (event.target === lightbox) closeLightbox();
+});
+
+/**
+ * Keyboard handling for the open dialog: Escape, arrows, and the focus trap.
+ *
+ * WHY A TRAP AT ALL. aria-modal="true" tells assistive technology the rest of
+ * the page is inert, but it does not make it so: Tab still walks into the page
+ * behind. A screen-reader user would be told they are in a dialog while their
+ * focus silently wanders into a form they cannot see. The trap makes the
+ * promise the attribute makes actually true.
+ */
+document.addEventListener('keydown', (event) => {
+  if (lightbox.hidden) return;
+
+  if (event.key === 'Escape')     { event.preventDefault(); closeLightbox(); return; }
+  if (event.key === 'ArrowLeft')  { event.preventDefault(); moveLightbox(-1); return; }
+  if (event.key === 'ArrowRight') { event.preventDefault(); moveLightbox(1); return; }
+  if (event.key !== 'Tab') return;
+
+  /* Queried live rather than cached: the arrow buttons become disabled at the
+     ends of the set, and a disabled control is not focusable — a cached list
+     would trap focus onto something the browser refuses to focus. */
+  const focusable = [...lightbox.querySelectorAll('button, [href], [tabindex]:not([tabindex="-1"])')]
+    .filter((node) => !node.disabled && node.offsetParent !== null);
+  if (!focusable.length) return;
+
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault(); first.focus();
+  }
+});

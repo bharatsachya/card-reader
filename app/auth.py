@@ -37,7 +37,7 @@ from typing import Optional
 
 import certifi
 import jwt
-from fastapi import Depends, HTTPException, Request
+from fastapi import HTTPException, Request
 from jwt import PyJWKClient
 
 from app.config import settings

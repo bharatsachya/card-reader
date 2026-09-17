@@ -43,3 +43,11 @@ samples/
 Dockerfile
 .dockerignore
 docker-compose.yml
+
+# --- Dev-only. None of this is needed to serve a request, and each file in
+# --- the image is one more thing to audit.
+tests/
+deploy/
+pytest.ini
+pyproject.toml
+requirements-dev.txt

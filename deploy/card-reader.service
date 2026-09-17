@@ -1,0 +1,66 @@
+# Card Reader as a systemd service — the non-Docker path.
+#
+# Install:
+#   sudo useradd --system --home /opt/card-reader --shell /usr/sbin/nologin cardreader
+#   sudo cp -r . /opt/card-reader && cd /opt/card-reader
+#   sudo python3 -m venv .venv && sudo ./.venv/bin/pip install -r requirements.txt
+#   sudo mkdir -p /var/lib/card-reader && sudo chown cardreader: /var/lib/card-reader
+#   sudo cp deploy/card-reader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now card-reader
+#
+# Logs:   journalctl -u card-reader -f
+
+[Unit]
+Description=Card Reader — business card lead extractor
+Documentation=https://github.com/bharatsachya/card-reader
+# Wants, not Requires: if ollama is on this box we prefer it started first,
+# but the app must still come up when the model is remote or temporarily down.
+# The app reports an unreachable model on /health rather than refusing to run.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=cardreader
+Group=cardreader
+WorkingDirectory=/opt/card-reader
+
+# State lives OUTSIDE the deployment directory, so redeploying by replacing
+# /opt/card-reader cannot delete the database and the retained images.
+Environment="DB_PATH=/var/lib/card-reader/leads.db"
+Environment="IMAGE_DIR=/var/lib/card-reader/images"
+Environment="STORE_BACKEND=sqlite"
+EnvironmentFile=-/etc/card-reader.env
+
+# One worker. Job state is an asyncio task inside ONE process, so a second
+# worker would accept uploads it cannot then report on. The model serves one
+# request at a time anyway.
+ExecStart=/opt/card-reader/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+
+Restart=on-failure
+RestartSec=5
+# Give an in-flight card time to finish before SIGKILL. Cards already extracted
+# are committed per card, so the worst case loses one card, not the batch.
+TimeoutStopSec=30
+
+# --- Hardening. Each line removes something the app demonstrably never uses. ---
+NoNewPrivileges=true
+PrivateTmp=true
+# Read-only filesystem except for the paths named below. StateDirectory gives
+# us /var/lib/card-reader with the right owner, created automatically.
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=card-reader
+ReadWritePaths=/var/lib/card-reader
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# The app makes outbound HTTP to the model and to Clerk's JWKS, and listens on
+# TCP. It has no use for anything else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

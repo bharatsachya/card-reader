@@ -586,3 +586,207 @@ h1, h2, h3 {
    sitting under a sentence that already says the job is done. Removed on
    completion rather than left at 100%. */
 .meter.is-done { display: none; }
+
+/* ============================================================================
+   Run history sidebar
+
+   FIXED, NOT A GRID COLUMN. The topbar and the composer are both `sticky`
+   against the body's scroll. Turning the page into a grid would give each
+   column its own scroll container and silently break both — the composer
+   would scroll away instead of staying docked. A fixed panel plus body
+   padding leaves that behaviour untouched.
+   ========================================================================= */
+
+.sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 30;
+  width: 17rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  background: var(--tint-soft);
+  /* One hairline, not a full border: the panel is already a distinct fill,
+     and the line only has to say where the scroll region ends. */
+  border-right: 1px solid var(--tint-line);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Off-canvas by default; the wide-screen media query brings it back. This
+     way the narrow layout needs no JavaScript to be correct on first paint. */
+  transform: translateX(-100%);
+  transition: transform 160ms ease;
+}
+.sidebar.is-open { transform: none; }
+
+.sidebar__head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.125rem 0.25rem 0;
+}
+.sidebar__title {
+  font-family: var(--font-head); font-weight: 600;
+  font-size: 0.9375rem; letter-spacing: 0.01em;
+}
+.sidebar__who {
+  padding: 0.375rem 0.5rem;
+  border-radius: var(--radius-control);
+  background: var(--tint);
+  font-size: 0.75rem;
+  color: var(--ink-soft, #6b6f72);
+  /* An email is one long unbreakable token; without this it forces the whole
+     fixed-width panel wider and clips the runs beneath it. */
+  overflow-wrap: anywhere;
+}
+
+.runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+.runs__empty { margin: 0.5rem; font-size: 0.8125rem; color: #6b6f72; }
+.runs__more { align-self: stretch; margin-top: 0.25rem; }
+
+.run {
+  width: 100%;
+  display: flex; flex-direction: column; gap: 0.3125rem;
+  padding: 0.5rem;
+  border: 0; border-radius: var(--radius-card);
+  background: transparent;
+  font: inherit; color: inherit; text-align: left;
+  cursor: pointer;
+}
+.run:hover { background: var(--tint); }
+.run.is-active { background: var(--tint-strong); }
+.run:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+
+.run__top { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+.run__when { font-size: 0.8125rem; font-weight: 500; }
+.run__count { font-size: 0.75rem; color: #6b6f72; }
+.run__stats { display: flex; gap: 0.375rem; font-size: 0.75rem; color: #6b6f72; }
+.run__stats .bad { color: var(--alarm); }
+.run__live {
+  font-size: 0.6875rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--ink);
+}
+.run__thumbs { display: flex; gap: 0.1875rem; }
+.run__thumbs img {
+  width: 2rem; height: 1.5rem; object-fit: cover;
+  border-radius: 4px; background: var(--tint-strong);
+}
+
+/* The dimmed layer behind an open off-canvas sidebar. Also the tap target
+   that closes it, which is what a phone user reaches for first. */
+.scrim {
+  position: fixed; inset: 0; z-index: 25;
+  background: rgb(0 0 0 / 0.32);
+}
+
+.iconbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.75rem; height: 1.75rem;
+  border: 0; border-radius: var(--radius-control);
+  background: transparent; color: inherit;
+  font-size: 1.125rem; line-height: 1; cursor: pointer;
+}
+.iconbtn:hover { background: var(--tint); }
+.iconbtn:focus-visible { outline: 2px solid var(--ink); outline-offset: 1px; }
+
+@media (min-width: 60rem) {
+  /* Wide enough for a permanent panel AND the table beside it. */
+  .sidebar { transform: none; }
+  .scrim, .topbar__toggle, #sidebar-close { display: none; }
+  body { padding-left: 17rem; }
+}
+
+/* ============================================================================
+   Lightbox
+   ========================================================================= */
+
+.lightbox {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  gap: 0.5rem;
+  padding: clamp(0.5rem, 2vw, 1.5rem);
+  background: rgb(12 13 14 / 0.82);
+}
+.lightbox[hidden] { display: none; }
+
+.lightbox__panel {
+  display: grid;
+  /* minmax(0, …) on both tracks: grid items default to min-content width, so
+     a long email in the side panel or a wide image would push the panel past
+     the viewport and force the whole overlay to scroll sideways. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 19rem);
+  gap: 0;
+  width: min(72rem, 100%);
+  max-height: 100%;
+  overflow: hidden;
+  border-radius: var(--radius-card);
+  background: var(--surface);
+}
+.lightbox__stage {
+  display: flex; align-items: center; justify-content: center;
+  min-width: 0; min-height: 0;
+  padding: 0.75rem;
+  background: #101112;
+  /* The whole mobile zoom story. No custom pinch handler: the native one is
+     smoother, already supports double-tap, and is the gesture people know. */
+  touch-action: pinch-zoom;
+  overflow: auto;
+}
+.lightbox__stage img { max-width: 100%; max-height: 78vh; object-fit: contain; }
+
+.lightbox__side {
+  display: flex; flex-direction: column; gap: 0.5rem;
+  min-width: 0;
+  padding: 0.875rem;
+  overflow-y: auto;
+}
+.lightbox__bar { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.lightbox__title {
+  margin: 0; font-family: var(--font-head); font-weight: 600; font-size: 1.0625rem;
+  overflow-wrap: anywhere;
+}
+.lightbox__count { margin: 0; font-size: 0.75rem; color: #6b6f72; }
+.lightbox__flag {
+  margin: 0; padding: 0.375rem 0.5rem;
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--alarm) 8%, transparent);
+  color: var(--alarm); font-size: 0.8125rem;
+}
+
+.fields { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.5rem; }
+.fields dt {
+  font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.05em;
+  color: #6b6f72;
+}
+.fields dd {
+  margin: 0.0625rem 0 0; font-size: 0.9375rem;
+  overflow-wrap: anywhere;      /* emails and long company names */
+}
+.fields dd.missing { color: #9a9ea1; }
+.fields dd.mono { font-family: var(--font-mono); font-size: 0.875rem; }
+
+.lightbox__nav {
+  flex: 0 0 auto;
+  width: 2.75rem; height: 2.75rem;
+  border: 0; border-radius: var(--radius-pill);
+  background: rgb(255 255 255 / 0.12); color: #fff;
+  font-size: 1.5rem; line-height: 1; cursor: pointer;
+}
+.lightbox__nav:hover:not(:disabled) { background: rgb(255 255 255 / 0.24); }
+.lightbox__nav:disabled { opacity: 0.3; cursor: default; }
+.lightbox__nav:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+@media (max-width: 52rem) {
+  .lightbox__panel { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .lightbox__stage img { max-height: 44vh; }
+  /* Arrows overlap the image on a phone rather than stealing width from it. */
+  .lightbox__nav { position: absolute; top: 50%; transform: translateY(-50%); }
+  .lightbox__nav--prev { left: 0.5rem; }
+  .lightbox__nav--next { right: 0.5rem; }
+}
+
+/* Rows in the leads table are clickable now, so say so. */
+.leads tbody tr { cursor: pointer; }
+.leads tbody tr:hover { background: var(--tint-soft); }
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar { transition: none; }
+}

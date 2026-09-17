@@ -29,7 +29,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from app.schema import LEAD_FIELDS, Lead
+from app.schema import Lead
 
 # Column order in the sheet: the seven extracted fields first, then provenance.
 # Diagnostics go last so the left-hand side of the sheet is the part a

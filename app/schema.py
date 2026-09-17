@@ -6,7 +6,7 @@ Excel export can never drift out of sync. If a field is added later, it is
 added here and every layer picks it up.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Optional
 
 # The seven fields we ask the model for, in display order.

@@ -1,0 +1,62 @@
+# Tooling configuration. There is no build backend here on purpose: this is an
+# application that is run, not a library that is installed, so it needs no
+# packaging metadata. Dependencies stay in requirements.txt where the Dockerfile
+# and pip both expect them.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"     # the minimum the project claims to support
+
+[tool.ruff.lint]
+# Chosen to catch BUGS, not to impose a style on code that predates the tool.
+# E/F/W/I are real errors, undefined names, unused imports and import order.
+# B and ASYNC catch genuine async and correctness traps. UP/SIM/RUF are
+# deliberately absent: they are stylistic, and a CI job that fails on
+# `Optional[str]` vs `str | None` trains people to ignore CI.
+select = ["E", "F", "W", "I", "B", "ASYNC"]
+
+# Each of these is a rule the codebase deliberately does not follow. They are
+# listed with the reason rather than disabled wholesale, so that a future
+# reader can tell "we decided this" from "nobody looked".
+ignore = [
+    # `raise ... from err` inside an except block. auth.py raises HTTPException
+    # from AuthError on purpose WITHOUT chaining: the original exception can
+    # carry token contents, and chaining puts it in the traceback and the logs.
+    "B904",
+    # Empty method in an ABC without @abstractmethod. initialize() and
+    # reclaim_stale_jobs() are intentionally CONCRETE no-ops so a store with
+    # nothing to set up inherits them rather than implementing two stubs.
+    "B027",
+    # zip() without strict=. One call, in the stub model server, over two
+    # lists built together in the same function.
+    "B905",
+    # A `timeout` parameter on an async helper. This is a test helper's polling
+    # deadline, not a cancellation scope.
+    "ASYNC109",
+    # Blocking pathlib in an async function: the image sweep, which runs once
+    # at startup before the server accepts traffic, over a few thousand files.
+    "ASYNC240",
+    # Optional[X] over X | None. A consistent style already applied across
+    # every module; churning ~30 annotations for no behavioural change would
+    # bury the real diffs in review.
+    # Function calls in argument defaults. This IS FastAPI's dependency
+    # injection syntax -- `user: User = Depends(require_user)` -- and the rule
+    # exists for mutable defaults, which Depends is not.
+    "B008",
+    # Nested `with` blocks. aiosqlite's connection and cursor are both context
+    # managers; combining them makes the line longer and the nesting is what
+    # shows the cursor's lifetime is inside the connection's.
+    "SIM117",
+    # Blocking open() inside an async function. Deliberate and documented in
+    # uploads.py: the alternative is a thread pool for a write that is already
+    # bounded by the upload's own network speed.
+    "ASYNC230",
+    # Blind `except Exception`. Exactly two exist, both deliberate and both
+    # documented: the detached job worker (an escaping exception would vanish
+    # into the event loop and strand the job) and JWKS resolution.
+    "BLE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on magic values and long literal fixtures; that is their job.
+"tests/*" = ["E501"]

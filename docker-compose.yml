@@ -1,0 +1,79 @@
+# Card Reader — app + model on one box.
+#
+#   docker compose up -d                  app + ollama
+#   docker compose --profile app-only up -d   app alone, MODEL_URL points elsewhere
+#
+# There is no `version:` key. Compose v2 ignores it and warns, and it has meant
+# nothing since the v1 file-format was retired.
+
+services:
+  app:
+    build: .
+    # Restart on crash and on boot, but NOT after an explicit `docker compose
+    # stop` -- that was a human decision and the machine should not overrule it.
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Set here rather than in .env because it is a property of the COMPOSE
+      # TOPOLOGY, not of the deployment: "ollama" is the service name above,
+      # resolved by Docker's internal DNS on the shared network. Putting it in
+      # .env would mean a file that only works inside compose.
+      MODEL_URL: ${MODEL_URL:-http://ollama:11434/v1/chat/completions}
+      # Absolute paths inside the volume mount. The image's WORKDIR is /app so
+      # the relative defaults would land in the same place, but being explicit
+      # means a future WORKDIR change cannot silently move the database.
+      DB_PATH: /app/data/leads.db
+      IMAGE_DIR: /app/data/images
+      STORE_BACKEND: sqlite
+    volumes:
+      # NAMED, not a bind mount. A bind mount inherits the host directory's
+      # uid, which will not be the container's uid 10001, and the app then
+      # cannot write -- surfacing as "unable to open database file". A named
+      # volume is initialised from the image, where /app/data is already
+      # owned by app.
+      - card-data:/app/data
+    depends_on:
+      ollama:
+        condition: service_started
+        required: false     # so --profile app-only works with no ollama present
+    healthcheck:
+      # Repeated here as well as in the Dockerfile so `docker compose ps` shows
+      # health even for an image built elsewhere.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    # NOT published to the host by default. The app reaches it over the compose
+    # network; exposing 11434 publicly would put an unauthenticated model
+    # endpoint on the internet for anyone to run inference on at your expense.
+    # Uncomment only for debugging from the host.
+    # ports:
+    #   - "127.0.0.1:11434:11434"
+    volumes:
+      # Model weights are gigabytes and are re-downloaded on every cold start
+      # without this. Separate from card-data so backing up your leads does not
+      # mean backing up a 3 GB model you can re-pull in a command.
+      - ollama-models:/root/.ollama
+    # After the first `up`, pull the model once:
+    #   docker compose exec ollama ollama pull qwen2.5vl:3b
+    #
+    # MEMORY. Qwen2.5-VL-3B needs roughly 4 GB resident. On a 2 vCPU / 8 GB
+    # box that leaves enough for the app, but not much -- and the OOM killer
+    # takes whichever process is largest, which is ollama, mid-extraction. The
+    # limit makes that failure explicit and attributable rather than random.
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+
+volumes:
+  card-data:
+  ollama-models:

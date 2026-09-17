@@ -63,7 +63,31 @@
 <!--GATE_END-->
 
 <div id="app" hidden>
+
+<!-- Run history. Fixed rather than a grid column so the sticky topbar and
+     sticky composer keep working unchanged; the body simply gains padding on
+     wide screens. Off-canvas below 60rem, where a permanent 17rem panel would
+     leave no room for the table it exists to open. -->
+<aside class="sidebar" id="sidebar" aria-label="Run history">
+  <div class="sidebar__head">
+    <span class="sidebar__title">History</span>
+    <button type="button" class="iconbtn" id="sidebar-close" aria-label="Close history">&times;</button>
+  </div>
+  <div class="sidebar__who" id="sidebar-who" hidden></div>
+  <ul class="runs" id="runs"></ul>
+  <p class="runs__empty" id="runs-empty">No runs yet.</p>
+  <button type="button" class="btn runs__more" id="runs-more" hidden>Load older</button>
+</aside>
+<div class="scrim" id="scrim" hidden></div>
+
 <header class="topbar">
+  <button type="button" class="iconbtn topbar__toggle" id="sidebar-toggle"
+          aria-label="Show run history" aria-expanded="false" aria-controls="sidebar">
+    <svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16">
+      <path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.5"
+            stroke-linecap="round" fill="none"/>
+    </svg>
+  </button>
   <!-- The loading mark: a 15-unit square whose perimeter (60) is an exact
        multiple of its 6+4 dash pattern, so the crawl loops with no seam. -->
   <svg class="mark" id="mark" viewBox="0 0 22 22" aria-hidden="true">
@@ -107,6 +131,36 @@
     </div>
   </div>
   <p class="dock__hint" id="hint">JPG, PNG, HEIC or WebP · up to 50 files, 15 MB each</p>
+</div>
+
+<!-- Full-view overlay for one card. role=dialog + aria-modal tells a screen
+     reader that the rest of the page is inert while this is open; the focus
+     trap in app.js is what makes that true for a keyboard as well. -->
+<div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true"
+     aria-labelledby="lightbox-title">
+  <button type="button" class="lightbox__nav lightbox__nav--prev" id="lb-prev"
+          aria-label="Previous card">&#8249;</button>
+
+  <div class="lightbox__panel" id="lightbox-panel">
+    <div class="lightbox__stage">
+      <!-- touch-action: pinch-zoom on this element is the entire mobile zoom
+           implementation. The browser's native pinch is smoother, handles
+           momentum and double-tap, and is what a phone user already knows. -->
+      <img id="lb-image" alt="">
+    </div>
+    <div class="lightbox__side">
+      <div class="lightbox__bar">
+        <h2 class="lightbox__title" id="lightbox-title">Card</h2>
+        <button type="button" class="iconbtn" id="lb-close" aria-label="Close">&times;</button>
+      </div>
+      <p class="lightbox__count" id="lb-count"></p>
+      <p class="lightbox__flag" id="lb-flag" hidden></p>
+      <dl class="fields" id="lb-fields"></dl>
+    </div>
+  </div>
+
+  <button type="button" class="lightbox__nav lightbox__nav--next" id="lb-next"
+          aria-label="Next card">&#8250;</button>
 </div>
 
 </div><!-- /#app -->

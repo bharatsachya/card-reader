@@ -29,6 +29,7 @@ Design choices that make the swap realistic rather than theoretical:
 """
 
 import asyncio
+import base64
 import os
 import pathlib
 import uuid
@@ -43,6 +44,10 @@ import aiosqlite
 
 from app.config import settings
 from app.schema import LEAD_FIELDS, Lead
+
+# How many thumbnails a history row shows. Small on purpose: each one is a
+# separate authenticated request, and the sidebar exists to be glanced at.
+THUMBNAILS_PER_JOB = 4
 
 
 def _now() -> str:
@@ -94,6 +99,14 @@ class Job:
     succeeded_count: Optional[int] = None
     failed_count: Optional[int] = None
 
+    # Lead ids for the few thumbnails the history sidebar shows on each row.
+    # Ids, not digests: the browser must fetch /api/leads/<id>/image, which is
+    # ownership-checked. Handing out raw digests would let the client build a
+    # URL addressed by CONTENT, and a content-addressed URL is the same for
+    # everyone -- two users who photographed the same conference badge would
+    # share a digest, so a digest-addressed route could not tell them apart.
+    thumbnail_lead_ids: list[str] = field(default_factory=list)
+
     @property
     def processed(self) -> int:
         if self.processed_count is not None:
@@ -124,6 +137,7 @@ class Job:
             "error": self.error,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
+            "thumbnails": self.thumbnail_lead_ids,
         }
 
     def to_dict(self) -> dict:
@@ -132,6 +146,47 @@ class Job:
 
     def owned_by(self, user_id: str) -> bool:
         return self.user_id == user_id
+
+
+@dataclass
+class JobPage:
+    """One page of job history, plus the cursor that continues it."""
+
+    jobs: list[Job]
+    # None means "this was the last page". The client stops asking.
+    next_cursor: Optional[str] = None
+
+
+def encode_cursor(job: Job) -> str:
+    """
+    An opaque cursor pointing just past `job`.
+
+    WHY CURSORS AND NOT OFFSET/LIMIT. `OFFSET 40` tells the database to find
+    and discard forty rows before returning any, so page 50 costs fifty pages
+    of work -- pagination that gets slower the further you scroll. Worse, the
+    offset is computed against a list that MOVES: finish a job while someone
+    is on page 2 and every row shifts down one, so page 3 begins with a row
+    they already saw and one row is never shown at all. A cursor names a
+    POSITION rather than a count, so insertions above it change nothing.
+
+    base64 not because it is secret -- it plainly is not -- but because an
+    opaque token stops clients from parsing it and depending on its shape,
+    which would freeze the pagination key forever.
+    """
+    raw = f"{job.created_at}|{job.id}".encode()
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_cursor(cursor: str) -> Optional[tuple[str, str]]:
+    """(created_at, id) from a cursor, or None if it is unusable."""
+    try:
+        created_at, _, job_id = base64.urlsafe_b64decode(cursor).decode().partition("|")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    # A cursor arrives from a URL, so it is user input. A malformed one means
+    # "start from the beginning", never a 500: the caller asked for a page of
+    # their own history and the worst honest answer is the first page.
+    return (created_at, job_id) if created_at and job_id else None
 
 
 class LeadStore(ABC):
@@ -166,9 +221,14 @@ class LeadStore(ABC):
         """
 
     @abstractmethod
-    async def list_jobs(self, user_id: str) -> list[Job]:
+    async def list_jobs(
+        self,
+        user_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> JobPage:
         """
-        That user's jobs, newest first.
+        That user's jobs, newest first, one page at a time.
 
         CONTRACT: the returned Jobs are SUMMARIES. `job.leads` may be empty
         even for a finished job -- a database store fills the counters instead,
@@ -177,6 +237,9 @@ class LeadStore(ABC):
         Stated here rather than left to be discovered, because the in-memory
         store happens to over-deliver and would hide a caller that got it
         wrong until the day the backend changed.
+
+        `limit=None` returns everything, which is what the Excel "export
+        everything" path wants and what the in-memory store has always done.
         """
 
     @abstractmethod
@@ -349,13 +412,47 @@ class InMemoryLeadStore(LeadStore):
                 if lead.image_sha256
             }
 
-    async def list_jobs(self, user_id: str) -> list[Job]:
+    async def list_jobs(
+        self,
+        user_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> JobPage:
         async with self._lock:
-            return sorted(
+            ordered = sorted(
                 (j for j in self._jobs.values() if j.user_id == user_id),
-                key=lambda j: j.created_at,
+                # Sorted by the same compound key the SQL uses. created_at
+                # alone is not a total order -- two jobs created in the same
+                # microsecond would tie, and a tie makes a cursor ambiguous:
+                # the row it points at could be either one, so pagination
+                # could repeat or skip. The id breaks the tie deterministically.
+                key=lambda j: (j.created_at, j.id),
                 reverse=True,
             )
+
+        if cursor:
+            position = decode_cursor(cursor)
+            if position:
+                ordered = [
+                    j for j in ordered if (j.created_at, j.id) < position
+                ]
+
+        for job in ordered:
+            job.thumbnail_lead_ids = [
+                lead.id for lead in job.leads if lead.image_sha256 and lead.id
+            ][:THUMBNAILS_PER_JOB]
+
+        if limit is None:
+            return JobPage(jobs=ordered, next_cursor=None)
+
+        # Fetch one MORE than asked for. If it comes back, there is another
+        # page; if it does not, this is the last one. Asking the database
+        # "is there more?" separately would be a second query racing the first.
+        page, has_more = ordered[:limit], len(ordered) > limit
+        return JobPage(
+            jobs=page,
+            next_cursor=encode_cursor(page[-1]) if has_more and page else None,
+        )
 
     async def all_leads(self, user_id: str) -> list[Lead]:
         async with self._lock:
@@ -413,8 +510,12 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- table scan, and no sort step at all, because the index is already in the
 -- requested order. An index on user_id alone would still need to sort every
 -- matching row afterwards.
+-- Includes `id` because keyset pagination orders by (created_at DESC, id DESC)
+-- and compares against both. Without the third column SQLite can still seek
+-- on the first two, but has to sort the ties itself -- and a sort step is
+-- exactly what keyset pagination exists to avoid.
 CREATE INDEX IF NOT EXISTS idx_jobs_user_created
-    ON jobs (user_id, created_at DESC);
+    ON jobs (user_id, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS leads (
     id              TEXT    PRIMARY KEY,
@@ -677,7 +778,12 @@ class SqliteLeadStore(LeadStore):
             )
             await conn.commit()
 
-    async def list_jobs(self, user_id: str) -> list[Job]:
+    async def list_jobs(
+        self,
+        user_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> JobPage:
         # The counters come from ONE aggregate over the leads index rather
         # than from loading every lead of every job and counting in Python.
         # For a user with 40 jobs of 30 cards, that is three integers per job
@@ -697,12 +803,71 @@ class SqliteLeadStore(LeadStore):
                 GROUP BY job_id
             ) c ON c.job_id = j.id
             WHERE j.user_id = ?
-            ORDER BY j.created_at DESC
+              {keyset}
+            ORDER BY j.created_at DESC, j.id DESC
+            {limit_clause}
         """
+        params: list = [user_id]
+
+        position = decode_cursor(cursor) if cursor else None
+        if position:
+            # KEYSET pagination, spelled out rather than using SQLite's
+            # row-value syntax so it reads the same on any engine: everything
+            # strictly before (created_at, id) in the sort order.
+            query = query.replace(
+                "{keyset}",
+                "AND (j.created_at < ? OR (j.created_at = ? AND j.id < ?))",
+            )
+            params += [position[0], position[0], position[1]]
+        else:
+            query = query.replace("{keyset}", "")
+
+        if limit is None:
+            query = query.replace("{limit_clause}", "")
+        else:
+            # limit + 1: the extra row is how we learn there is a next page.
+            query = query.replace("{limit_clause}", "LIMIT ?")
+            params.append(limit + 1)
+
         async with self._connect() as conn:
-            async with conn.execute(query, (user_id,)) as cursor:
-                rows = await cursor.fetchall()
-        return [self._row_to_job(row, with_counts=True) for row in rows]
+            async with conn.execute(query, params) as db_cursor:
+                rows = await db_cursor.fetchall()
+
+            jobs = [self._row_to_job(row, with_counts=True) for row in rows]
+            has_more = limit is not None and len(jobs) > limit
+            if has_more:
+                jobs = jobs[:limit]
+            await self._attach_thumbnails(conn, jobs)
+
+        return JobPage(
+            jobs=jobs,
+            next_cursor=encode_cursor(jobs[-1]) if has_more and jobs else None,
+        )
+
+    @staticmethod
+    async def _attach_thumbnails(
+        conn: aiosqlite.Connection, jobs: list[Job]
+    ) -> None:
+        """
+        Fill thumbnail_lead_ids for a page of jobs in ONE query.
+
+        The obvious version runs a SELECT per job -- the N+1 query problem.
+        Twenty jobs in the sidebar becomes twenty-one round trips, and it gets
+        worse exactly as the feature gets used. One IN (...) covers the page.
+        """
+        if not jobs:
+            return
+        by_id = {job.id: job for job in jobs}
+        placeholders = ", ".join("?" * len(by_id))
+        async with conn.execute(
+            f"SELECT job_id, id FROM leads WHERE job_id IN ({placeholders}) "
+            "AND image_sha256 IS NOT NULL ORDER BY rowid",
+            tuple(by_id),
+        ) as cursor:
+            for job_id, lead_id in await cursor.fetchall():
+                bucket = by_id[job_id].thumbnail_lead_ids
+                if len(bucket) < THUMBNAILS_PER_JOB:
+                    bucket.append(lead_id)
 
     async def all_leads(self, user_id: str) -> list[Lead]:
         # The JOIN is the authorisation. Ownership lives on the job, so leads

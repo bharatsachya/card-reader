@@ -119,6 +119,44 @@ class Settings:
         # Shipped to the browser, which is what publishable keys are for.
         self.clerk_publishable_key: str = _env_str("CLERK_PUBLISHABLE_KEY", "")
 
+        # AUTH_MODE: "clerk" verifies real session tokens; "local" runs every
+        # request as a single fixed user.
+        #
+        # WHY AN EXPLICIT MODE RATHER THAN INFERRING FROM THE KEYS. Auth used
+        # to switch itself off whenever CLERK_ISSUER was blank. That is a
+        # helpful default and a dangerous one: a typo'd variable name, a
+        # secret that failed to mount, an env file that did not load -- and a
+        # production deployment silently serves every user's leads to every
+        # visitor, with a completely healthy /health and nothing in the logs.
+        # Security that disables itself when misconfigured is not a safe
+        # default; it is a silent one.
+        #
+        # So the mode is stated, and stating "clerk" without the keys is a
+        # hard startup failure (see _validate below) rather than a quiet
+        # downgrade. Inference is kept only when AUTH_MODE is unset, so
+        # existing setups and `curl localhost:8000` keep working.
+        self.auth_mode: str = _env_str(
+            "AUTH_MODE",
+            "clerk" if (self.clerk_issuer and self.clerk_publishable_key) else "local",
+        ).lower()
+
+        self._validate()
+
+    def _validate(self) -> None:
+        """Refuse to start in a configuration that is quietly wrong."""
+        if self.auth_mode not in {"clerk", "local"}:
+            raise ValueError(
+                f"unknown AUTH_MODE {self.auth_mode!r}; expected 'clerk' or 'local'"
+            )
+        if self.auth_mode == "clerk" and not (
+            self.clerk_issuer and self.clerk_publishable_key
+        ):
+            raise ValueError(
+                "AUTH_MODE=clerk requires both CLERK_ISSUER and "
+                "CLERK_PUBLISHABLE_KEY. Refusing to start rather than falling "
+                "back to unauthenticated access."
+            )
+
         # --- Backpressure / resource limits ---------------------------------
         # These exist to make the server survive a hostile or careless upload.
         # Every one of them rejects work BEFORE memory is spent on it.
@@ -222,8 +260,13 @@ class Settings:
 
     @property
     def auth_enabled(self) -> bool:
-        """Auth is on only when BOTH halves are configured."""
-        return bool(self.clerk_issuer and self.clerk_publishable_key)
+        """
+        Whether requests must carry a verified Clerk token.
+
+        Reads from the mode, not from whether keys happen to be present, so
+        that a missing key is a startup error rather than an open door.
+        """
+        return self.auth_mode == "clerk"
 
     @property
     def clerk_jwks_url(self) -> str:
@@ -249,6 +292,7 @@ class Settings:
             "max_concurrency": self.max_concurrency,
             "model_max_attempts": self.model_max_attempts,
             "auth_enabled": self.auth_enabled,
+            "auth_mode": self.auth_mode,
             # Reported because "where did my jobs go after the restart?" is
             # answered instantly by seeing store_backend=memory here.
             "store_backend": self.store_backend,

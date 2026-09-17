@@ -5,8 +5,12 @@ Run it with:  uvicorn app.main:app --reload --port 8000
 "app.main" is the module path, ":app" is the variable below that uvicorn serves.
 """
 
+import asyncio
+import contextlib
 import logging
 import pathlib
+import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -265,19 +269,84 @@ def index() -> HTMLResponse:
     )
 
 
-@app.get("/health")
-def health() -> dict:
-    """
-    Liveness + configuration check.
+# Cached result of the model-endpoint probe: (monotonic_time, payload).
+_model_probe: tuple[float, dict] | None = None
+# How long a probe result is reused. Long enough that a load balancer polling
+# every few seconds does not open a socket per poll; short enough that a dead
+# backend shows up within a deploy's worth of time.
+_MODEL_PROBE_TTL_SECONDS = 15.0
+# A TCP handshake to a host that is up takes microseconds locally and low
+# milliseconds across a VNet. Two seconds is already pathological, and the cap
+# is what keeps /health's worst case bounded.
+_MODEL_PROBE_TIMEOUT = 2.0
 
-    Deliberately does NOT call the model. A health endpoint should answer
-    "is this web process up?" in milliseconds, because load balancers poll it
-    every few seconds. Calling a CPU-hosted model here would make it take
-    30+ seconds and the orchestrator would kill a healthy container.
+
+async def _probe_model_endpoint() -> dict:
+    """
+    Can we open a TCP connection to the model's host and port?
+
+    THIS IS NOT AN INFERENCE CALL, AND THE DISTINCTION IS THE WHOLE POINT.
+    /api/model-check sends a real 1x1 image through the model and takes as
+    long as the model takes -- on this hardware, up to 170 seconds. Putting
+    that in /health would mean a liveness probe that cannot finish inside any
+    sane timeout, so the orchestrator would kill a perfectly healthy container
+    because something DOWNSTREAM was slow. That turns a model slowdown into a
+    restart loop, which is strictly worse than the original problem.
+
+    A TCP connect answers the question that actually distinguishes the common
+    failure -- "MODEL_URL points at nothing" -- in about a millisecond, and it
+    cannot block for longer than the timeout above. What it deliberately does
+    NOT tell you is whether the model can answer; that is /api/model-check's
+    job, and it is a question you ask by hand.
+    """
+    global _model_probe
+
+    now = time.monotonic()
+    if _model_probe and (now - _model_probe[0]) < _MODEL_PROBE_TTL_SECONDS:
+        return _model_probe[1]
+
+    parsed = urllib.parse.urlparse(settings.model_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    result = {"host": host, "port": port}
+    started = time.monotonic()
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=_MODEL_PROBE_TIMEOUT
+        )
+        writer.close()
+        # Suppressed: we only wanted the handshake, and a peer that resets the
+        # connection during close has still proved it is listening.
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        result |= {"reachable": True}
+    except (TimeoutError, asyncio.TimeoutError):
+        result |= {"reachable": False, "error": "timed out opening a connection"}
+    except OSError as exc:
+        # Connection refused, DNS failure, no route. The usual and most useful
+        # finding: the URL is wrong or the model is not running.
+        result |= {"reachable": False, "error": str(exc)}
+    result["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+
+    _model_probe = (now, result)
+    return result
+
+
+@app.get("/health")
+async def health() -> dict:
+    """
+    Liveness + configuration + a cheap reachability check on the model endpoint.
+
+    Still answers in milliseconds, still never runs inference. See
+    _probe_model_endpoint for why the distinction matters, and note the result
+    is cached so that a load balancer polling every second does not open a
+    socket every second.
     """
     return {
         "status": "ok",
         "service": "card-reader",
+        "model_endpoint": await _probe_model_endpoint(),
         # Reported because it depends on an optional wheel being installed:
         # if this is false on the AWS box, every iPhone upload will fail and
         # this is the fastest way to find out.
@@ -526,11 +595,41 @@ async def lead_image(
     )
 
 
+# Default page size for the history sidebar. Enough to fill a tall screen
+# without the first paint waiting on a hundred rows; the client asks for more
+# as the user scrolls.
+DEFAULT_JOBS_PAGE = 20
+MAX_JOBS_PAGE = 100
+
+
 @app.get("/api/jobs")
-async def list_jobs(user: User = Depends(require_user)) -> dict:
-    """That user's jobs, newest first, as cheap summaries."""
-    jobs = await store.list_jobs(user.id)
-    return {"jobs": [job.summary() for job in jobs]}
+async def list_jobs(
+    limit: int = DEFAULT_JOBS_PAGE,
+    cursor: str | None = None,
+    user: User = Depends(require_user),
+) -> dict:
+    """
+    That user's jobs, newest first, as cheap summaries.
+
+    Cursor-paginated rather than offset-paginated. An offset makes the
+    database count and discard rows it will not return, so deep pages get
+    slower, and it is computed against a list that MOVES -- finishing a job
+    while someone is on page 2 shifts every row down one, so page 3 repeats a
+    row and hides another. A cursor names a position, so rows appearing above
+    it change nothing below.
+
+    `limit` is clamped rather than rejected: a client asking for 10,000 rows
+    has made a mistake, not an attack, and the useful response is the largest
+    page we are willing to serve.
+    """
+    limit = max(1, min(limit, MAX_JOBS_PAGE))
+    page = await store.list_jobs(user.id, limit=limit, cursor=cursor)
+    return {
+        "jobs": [job.summary() for job in page.jobs],
+        # Explicitly null on the last page, so the client has a single
+        # unambiguous stop condition rather than inferring from a short page.
+        "next_cursor": page.next_cursor,
+    }
 
 
 # --------------------------------------------------------------------------
