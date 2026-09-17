@@ -43,13 +43,39 @@ app = FastAPI(
 # server is idle-waiting on the model anyway. Same origin also means fetch()
 # calls need no CORS headers at all.
 STATIC_DIR = pathlib.Path(__file__).resolve().parent.parent / "static"
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+class NoCacheStatic(StaticFiles):
+    """
+    Serve static files with caching disabled.
+
+    Browsers cache JS and CSS aggressively, which during development produces
+    one of the most wasteful debugging loops there is: you fix a bug, reload,
+    see the OLD file, and conclude the fix did not work. Telling the browser
+    not to store these removes that whole class of false signal.
+
+    For a production deployment you would do the opposite -- cache hard and
+    bust with a content hash in the filename -- but this app is served by the
+    same process that does the work, the files are a few hundred kilobytes,
+    and being able to trust a reload is worth more than the bytes.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
+
+
+app.mount("/static", NoCacheStatic(directory=STATIC_DIR), name="static")
 
 
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     """Serve the single-page UI."""
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
 
 
 @app.get("/health")

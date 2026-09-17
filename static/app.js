@@ -578,6 +578,63 @@ async function presentSignIn(auth) {
 }
 
 /**
+ * Notice that the user signed in, however they did it.
+ *
+ * Clerk.addListener() fires when the session changes, and for a sign-in that
+ * happens inside this page it is enough. But sign-in frequently happens
+ * SOMEWHERE ELSE: a popup, a second tab, or a redirect to Clerk's hosted
+ * portal. In those cases this page's listener may never fire, so the gate sits
+ * there while the user is — from Clerk's point of view — perfectly signed in.
+ * That is indistinguishable from "the app is broken".
+ *
+ * So the listener is kept as the fast path and backed by two things that do
+ * not depend on it: a poll, and the window regaining focus (which is exactly
+ * when the user returns from a popup or another tab).
+ *
+ * Polling a local object costs nothing — it is a property read, not a network
+ * call. Clerk keeps the session object up to date itself.
+ */
+function watchForSignIn(auth) {
+  let done = false;
+
+  const proceed = () => {
+    if (done || !auth.signedIn) return;
+    done = true;
+    /* A reload re-runs boot() against a live session, rather than trying to
+       hot-swap a page that was built for the signed-out case. */
+    window.location.reload();
+  };
+
+  try {
+    auth.clerk.addListener(proceed);
+  } catch { /* the poll below covers us */ }
+
+  window.addEventListener('focus', proceed);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) proceed();
+  });
+
+  const timer = setInterval(() => {
+    if (done) { clearInterval(timer); return; }
+    proceed();
+  }, 1000);
+
+  /* A manual escape hatch, in case every automatic route fails. It costs one
+     button and removes the possibility of a dead end. */
+  const manual = el('gate-continue');
+  manual.hidden = false;
+  manual.addEventListener('click', () => {
+    if (auth.signedIn) window.location.reload();
+    else {
+      const fallback = el('gate-fallback');
+      fallback.textContent = 'Still no session on this page. Open the '
+        + 'diagnostics below, or clear the session and sign in again.';
+      fallback.classList.add('is-trouble');
+    }
+  });
+}
+
+/**
  * Explain, on the page, why the gate is still up.
  *
  * The failure this is really hunting for: a session belonging to a DIFFERENT
@@ -707,12 +764,7 @@ async function boot() {
   } else if (!auth.signedIn) {
     showGate();
     await presentSignIn(auth);
-    /* Clerk fires this whenever the session changes. Reloading after sign-in
-       is the simplest correct thing: it re-runs boot() with a live session
-       rather than trying to hot-swap the page's state. */
-    try {
-      auth.clerk.addListener(({ user }) => { if (user) window.location.reload(); });
-    } catch { /* listener is a nicety; the reload below still covers us */ }
+    watchForSignIn(auth);
     return;   // the app stays inert until there is a user
   } else {
     gate.hidden = true;
