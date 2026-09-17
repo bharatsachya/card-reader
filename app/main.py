@@ -86,6 +86,11 @@ def auth_config() -> dict:
     return {
         "auth_enabled": settings.auth_enabled,
         "publishable_key": settings.clerk_publishable_key,
+        # Returned so the page can compare it against the `iss` claim in the
+        # token it actually holds. A mismatch (a session left over from a
+        # different Clerk instance) otherwise presents as an unexplained 401
+        # loop: sign in, land back on the sign-in screen, repeat.
+        "issuer": settings.clerk_issuer,
     }
 
 

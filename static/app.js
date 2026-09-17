@@ -556,6 +556,7 @@ async function presentSignIn(auth) {
     auth.clerk.mountSignIn(container);
   } catch (error) {
     revealButtons(`Embedded form unavailable (${error.message}). Use the buttons above.`, true);
+    await fillDiagnostics(auth);
     return;
   }
 
@@ -563,6 +564,8 @@ async function presentSignIn(auth) {
      Mounting is asynchronous inside Clerk, so checking immediately would
      always report empty. */
   await new Promise((resolve) => setTimeout(resolve, 1500));
+
+  await fillDiagnostics(auth);
 
   if (container.childElementCount === 0) {
     revealButtons(
@@ -572,6 +575,75 @@ async function presentSignIn(auth) {
       false,
     );
   }
+}
+
+/**
+ * Explain, on the page, why the gate is still up.
+ *
+ * The failure this is really hunting for: a session belonging to a DIFFERENT
+ * Clerk instance than the one the server verifies against. That presents as an
+ * unexplained loop — sign in, land back on the sign-in screen, repeat — because
+ * the browser genuinely has a valid session and the server genuinely rejects
+ * its token, and neither side is wrong on its own terms. Comparing the token's
+ * `iss` claim with the issuer the server expects names it immediately.
+ */
+async function fillDiagnostics(auth) {
+  const body = el('diag-body');
+  const rows = [];
+  const add = (label, value, state) => rows.push([label, value, state]);
+
+  add('Clerk loaded', auth.clerk ? `yes (v${auth.clerk.version || '?'})` : 'no',
+      auth.clerk ? 'ok' : 'bad');
+  add('Clerk user', auth.clerk?.user ? auth.clerk.user.id : 'none',
+      auth.clerk?.user ? 'ok' : null);
+  add('Clerk session', auth.clerk?.session ? auth.clerk.session.id : 'none',
+      auth.clerk?.session ? 'ok' : null);
+  add('Browser instance', auth.host, 'ok');
+  add('Server expects', (auth.expectedIssuer || '').replace('https://', ''), 'ok');
+
+  /* If there is a token, compare who issued it with who the server trusts. */
+  const token = await auth.getToken();
+  if (token) {
+    const claims = window.CardReaderAuth.peekClaims(token);
+    const issuer = (claims?.iss || '').replace('https://', '');
+    const expected = (auth.expectedIssuer || '').replace('https://', '');
+    const matches = issuer && expected && issuer === expected;
+    add('Token issued by', issuer || 'unreadable', matches ? 'ok' : 'bad');
+    if (!matches) {
+      add('Problem',
+          'This session belongs to a different Clerk instance than the server '
+          + 'accepts. Clear it below, then sign in again.', 'bad');
+    }
+  } else {
+    add('Token', 'none issued', null);
+  }
+
+  /* What the server actually says right now. */
+  try {
+    const response = await fetch('/api/jobs', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    add('Server response', `HTTP ${response.status}`, response.ok ? 'ok' : 'bad');
+  } catch (error) {
+    add('Server response', error.message, 'bad');
+  }
+
+  body.replaceChildren();
+  for (const [label, value, state] of rows) {
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    dd.textContent = value;
+    if (state) dd.className = state;
+    body.append(dt, dd);
+  }
+
+  /* Signing out clears a stale session so the next attempt starts clean —
+     the fix for the mismatch above, and harmless otherwise. */
+  el('diag-signout').addEventListener('click', async () => {
+    try { await auth.clerk.signOut(); } catch { /* nothing to sign out of */ }
+    window.location.reload();
+  });
 }
 
 /** Open Clerk's modal, or fall back to its hosted page. */

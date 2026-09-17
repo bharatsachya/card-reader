@@ -64,6 +64,9 @@ async function initAuth() {
     return { enabled: false, getToken: async () => null, user: null };
   }
 
+  // Kept so the page can compare it against the token it holds.
+  const expectedIssuer = config.issuer || '';
+
   if (!config.auth_enabled || !config.publishable_key) {
     // Auth switched off server-side: run the app with no sign-in at all.
     return { enabled: false, getToken: async () => null, user: null };
@@ -86,6 +89,7 @@ async function initAuth() {
        neither the embedded form nor the modal works. */
     accountsHost: host.replace('.clerk.accounts.dev', '.accounts.dev'),
     host,
+    expectedIssuer,
     get user() { return window.Clerk.user; },
     /**
      * Whether this browser is signed in.
@@ -145,4 +149,24 @@ function makeApi(auth, onUnauthenticated) {
   };
 }
 
-window.CardReaderAuth = { initAuth, makeApi };
+/**
+ * Read a JWT's payload WITHOUT verifying it. For display only.
+ *
+ * This is safe precisely because nothing is trusted from it: it feeds a
+ * diagnostic line on screen, never an access decision. The server does the
+ * real verification against Clerk's public keys, and that is the only check
+ * that counts. Decoding a token client-side to decide what a user may do
+ * would be the classic mistake — anyone can edit the payload of an unverified
+ * token.
+ */
+function peekClaims(token) {
+  try {
+    const payload = token.split('.')[1];
+    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+window.CardReaderAuth = { initAuth, makeApi, peekClaims };

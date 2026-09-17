@@ -43,6 +43,15 @@
         <button type="button" class="btn btn--primary" id="gate-signin">Sign in</button>
         <button type="button" class="btn" id="gate-signup">Create an account</button>
         <p class="gate__fallback" id="gate-fallback"></p>
+
+        <!-- Why you are still seeing this screen. Filled in at runtime.
+             On the page rather than in the console, because a sign-in screen
+             that cannot explain itself sends people hunting through DevTools. -->
+        <details class="diag" id="diag">
+          <summary>Why am I seeing this?</summary>
+          <dl id="diag-body"></dl>
+          <button type="button" class="btn" id="diag-signout">Clear session and start over</button>
+        </details>
       </div>
     </div>
   </div>
