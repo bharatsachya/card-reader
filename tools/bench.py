@@ -329,6 +329,9 @@ def main() -> int:
     parser.add_argument("--baseline", type=float, default=None,
                         help="seconds per card to compare against, e.g. 172")
     parser.add_argument("--out", type=pathlib.Path, default=None)
+    parser.add_argument("--cold-each", action="store_true",
+                        help="evict the model before EVERY card, so each one "
+                             "pays the load cost (the A1 cold-start measurement)")
     parser.add_argument("--no-reset", action="store_true",
                         help="skip the cache reset before the first measurement")
     parser.add_argument("--label", default="",
@@ -362,6 +365,12 @@ def main() -> int:
             if repeat:
                 reset_cache(args.model)
             for card in cards:
+                if args.cold_each:
+                    # Unload between every card, so each measurement includes
+                    # the 3.2 GB reload. Paired against a --no-reset run, the
+                    # difference IS the keep-alive saving -- measured rather
+                    # than inferred from the model file size.
+                    reset_cache(args.model)
                 jpeg, size = preprocess(card["raw"], edge, args.crop)
                 sizes.append(size)
                 try:
