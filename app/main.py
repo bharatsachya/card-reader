@@ -35,6 +35,35 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def no_store_api(request, call_next):
+    """
+    Forbid caching of every API response.
+
+    An API response describes state that changes. A browser that reuses a
+    cached copy shows the user a past answer with no indication it is doing so,
+    and the symptoms are baffling rather than obviously cache-shaped:
+
+      * /api/auth-config cached from when auth was ON keeps the sign-in gate up
+        after auth has been switched OFF, so no amount of restarting the server
+        changes what the page does.
+      * /api/jobs/{id} cached during a poll freezes the progress bar at whatever
+        it said the first time, making a healthy job look hung.
+
+    Static files get the same treatment above, for the same reason: a cached
+    bundle makes a fix look like it did not work.
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/api/") or request.url.path == "/health":
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        # An ETag would let the browser revalidate and reuse the body; for
+        # state that changes every second that is exactly what we do not want.
+        # MutableHeaders has no .pop(), so delete it explicitly.
+        if "etag" in response.headers:
+            del response.headers["etag"]
+    return response
+
+
 # Serve the frontend from this same process.
 #
 # WHY NOT A SEPARATE FRONTEND SERVER: the page is three static files. Putting
