@@ -70,12 +70,19 @@
      leave no room for the table it exists to open. -->
 <aside class="sidebar" id="sidebar" aria-label="Run history">
   <div class="sidebar__head">
-    <span class="sidebar__title">History</span>
+    <span class="sidebar__title">Sessions</span>
     <button type="button" class="iconbtn" id="sidebar-close" aria-label="Close history">&times;</button>
   </div>
+
+  <!-- Opens an empty thread. Cards added while it is open belong to it, and
+       one spreadsheet covers the whole session however many uploads it took. -->
+  <button type="button" class="btn btn--primary newsession" id="new-session">
+    + New session
+  </button>
+
   <div class="sidebar__who" id="sidebar-who" hidden></div>
   <ul class="runs" id="runs"></ul>
-  <p class="runs__empty" id="runs-empty">No runs yet.</p>
+  <p class="runs__empty" id="runs-empty">No sessions yet.</p>
   <button type="button" class="btn runs__more" id="runs-more" hidden>Load older</button>
 </aside>
 <div class="scrim" id="scrim" hidden></div>

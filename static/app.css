@@ -801,3 +801,34 @@ h1, h2, h3 {
   font-variant-numeric: tabular-nums;   /* the number must not jitter as it ticks */
 }
 .reply__eta:empty { display: none; }
+
+/* "New session" sits above the list, not in it: it is an action, and putting
+   it inside the scrolling list would move it off screen exactly when someone
+   has scrolled through history looking for a reason to start fresh. */
+.newsession {
+  width: 100%;
+  justify-content: center;
+  margin-bottom: 0.25rem;
+}
+
+/* The session currently being added to. Distinguished from merely selected,
+   because "which one will my next upload land in" is the question the sidebar
+   has to answer at a glance. */
+.run.is-current::after {
+  content: "current";
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink);
+  background: var(--tint-strong);
+  border-radius: var(--radius-pill);
+  padding: 0.0625rem 0.375rem;
+  align-self: flex-start;
+}
+.run__title {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

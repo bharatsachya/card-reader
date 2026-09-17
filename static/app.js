@@ -312,6 +312,10 @@ sendBtn.addEventListener('click', async () => {
   /* The field name must be "files" for every file — that repetition is what
      FastAPI's `files: list[UploadFile]` binds to. */
   for (const file of files) form.append('files', file);
+  /* Join the open session if there is one. When there is not — first load, or
+     straight after a page refresh — the server opens one and tells us which,
+     so the UI never has to guess and a bare curl still works. */
+  if (currentSessionId) form.append('session_id', currentSessionId);
 
   let data;
   try {
@@ -330,11 +334,14 @@ sendBtn.addEventListener('click', async () => {
 
   liveJobId = data.job_id;
   liveReply = reply;
-  openJobId = data.job_id;
-  /* Refreshed now, not when the job finishes, so the run appears in the
-     sidebar the moment it starts -- a history panel that only shows completed
-     work is useless during the 25 minutes you most want to look at it. */
-  loadRuns();
+  /* The server is the authority on which session this landed in: it may have
+     opened a new one, or declined an id that was not ours. */
+  currentSessionId = data.session_id || currentSessionId;
+  openSessionId = currentSessionId;
+  /* Refreshed now, not when the job finishes, so the session appears in the
+     sidebar the moment work starts -- a history panel that only shows
+     completed work is useless during the hour you most want to look at it. */
+  loadSessions();
 
   startPolling(data.job_id, data.accepted, reply);
 });
@@ -457,10 +464,6 @@ async function poll(reply) {
     lastProcessed = job.processed;
 
     renderTable(reply, job.leads);
-    /* Repainted from the poll response we already have rather than by
-       re-fetching /api/jobs: the progress numbers are right there, and a
-       second request per second per tab is pure waste. */
-    refreshRunningRow(job);
     const pct = job.total ? Math.round((job.processed / job.total) * 100) : 0;
     reply.fill.style.width = `${pct}%`;
 
@@ -500,7 +503,15 @@ function finishReply(reply, job) {
   sendBtn.disabled = chosen.length === 0;
 
   paintReplyOutcome(reply, job);
-  loadRuns();          /* the run just moved from "running" to a final state */
+  /* The session's card and success counts just changed, and so did the
+     spreadsheet behind the download button. */
+  loadSessions();
+  if (openSessionId) {
+    api(`/api/sessions/${encodeURIComponent(openSessionId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((session) => { if (session) addSessionDownload(session); })
+      .catch(() => { /* the per-job download below still works */ });
+  }
 }
 
 /** The presentational half: safe to call for any job, live or historical. */
@@ -944,7 +955,7 @@ async function boot() {
     sidebarWho.hidden = false;
   }
 
-  loadRuns();
+  loadSessions();
 }
 
 boot();
@@ -1008,7 +1019,16 @@ async function fillImage(img, leadId) {
 }
 
 /* ============================================================================
-   Run history sidebar
+   Session history sidebar
+
+   A SESSION IS THE UNIT, NOT AN UPLOAD. A job is one batch of files; someone
+   collecting cards at a conference photographs them in several goes. Grouping
+   those into a session means one spreadsheet covers the lot, instead of three
+   downloads to merge by hand.
+
+   The model is a chat thread: "New session" opens an empty one, everything
+   uploaded while it is open belongs to it, and clicking an old one reopens it
+   with every upload it contains, in order.
    ========================================================================= */
 
 const sidebar     = el('sidebar');
@@ -1018,161 +1038,272 @@ const runsMore    = el('runs-more');
 const scrim       = el('scrim');
 const sidebarWho  = el('sidebar-who');
 
-let nextCursor = null;      // pagination cursor; null = no more pages
-let openJobId = null;       // which run the main panel is showing
-let liveJobId = null;       // the job currently being polled, if any
-let liveReply = null;       // its assistant-turn handles, so we can scroll to it
+let nextCursor = null;        // pagination cursor; null = no more pages
+let currentSessionId = null;  // where the next upload lands
+let openSessionId = null;     // which session the main panel is showing
+let liveJobId = null;         // the job currently being polled, if any
+let liveReply = null;         // its handles, so we can scroll to it
 
-/** Relative time, because "3 minutes ago" is what a history list is scanned for. */
+/**
+ * A session's display name in the viewer's own timezone.
+ *
+ * Falls back to the stored title if the timestamp cannot be parsed, so a row
+ * is never blank -- an unlabelled entry in a history list is indistinguishable
+ * from every other unlabelled entry.
+ */
+function sessionLabel(session) {
+  const when = new Date(session.created_at);
+  if (Number.isNaN(when.getTime())) return session.title || 'Session';
+  return when.toLocaleString(undefined, {
+    day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+  });
+}
+
+/** Relative time, because a history list is scanned, not read. */
 function relativeTime(iso) {
   const then = new Date(iso).getTime();
   if (Number.isNaN(then)) return '';
   const seconds = Math.max(0, (Date.now() - then) / 1000);
-  if (seconds < 60)    return 'just now';
-  if (seconds < 3600)  return `${Math.floor(seconds / 60)} min ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
+  if (seconds < 60)     return 'just now';
+  if (seconds < 3600)   return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400)  return `${Math.floor(seconds / 3600)} h ago`;
   if (seconds < 604800) return `${Math.floor(seconds / 86400)} d ago`;
   return new Date(then).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-function buildRunRow(job) {
+function buildSessionRow(session) {
   const li = document.createElement('li');
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'run';
-  button.dataset.jobId = job.job_id;
-  if (job.job_id === openJobId) button.classList.add('is-active');
+  button.dataset.sessionId = session.session_id;
+
+  const title = document.createElement('span');
+  title.className = 'run__title';
+  /* Rendered from created_at in the BROWSER's timezone, not from the stored
+     title. The server writes that title in UTC, so a user in IST opening a
+     session at 00:11 local sees it labelled with yesterday's date -- correct,
+     and confusing every time. created_at is ISO-8601 with an offset, so the
+     browser can place it properly; the stored title remains what the API and
+     the export filename use, which must not drift per viewer. */
+  title.textContent = sessionLabel(session);
 
   const top = document.createElement('div');
   top.className = 'run__top';
   const when = document.createElement('span');
   when.className = 'run__when';
-  when.textContent = relativeTime(job.created_at);
+  when.textContent = relativeTime(session.created_at);
   const count = document.createElement('span');
   count.className = 'run__count';
-  count.textContent = plural(job.total, 'card');
+  count.textContent = session.cards
+    ? plural(session.cards, 'card')
+    : 'empty';
   top.append(when, count);
 
   const stats = document.createElement('div');
   stats.className = 'run__stats';
   stats.dataset.role = 'stats';
-  paintStats(stats, job);
+  paintStats(stats, session);
 
   const thumbs = document.createElement('div');
   thumbs.className = 'run__thumbs';
-  (job.thumbnails || []).forEach((leadId) => {
+  (session.thumbnails || []).forEach((leadId) => {
     const img = document.createElement('img');
-    img.alt = '';                 // decorative; the counts carry the meaning
+    img.alt = '';
     img.loading = 'lazy';
     thumbs.append(img);
     fillImage(img, leadId);
   });
 
-  button.append(top, stats, thumbs);
-  button.addEventListener('click', () => openRun(job.job_id));
+  button.append(title, top, stats, thumbs);
+  button.addEventListener('click', () => openSession(session.session_id));
   li.append(button);
   return li;
 }
 
-/** The success/failure line, split out so a poll can repaint it in place. */
-function paintStats(node, job) {
+/** Split out so a poll can repaint a running session's counters in place. */
+function paintStats(node, session) {
   node.replaceChildren();
-  if (job.status === 'running' || job.status === 'queued') {
-    const live = document.createElement('span');
-    live.className = 'run__live shimmer-text';
-    live.textContent = `${job.processed}/${job.total}`;
-    node.append(live);
-    return;
-  }
+  if (!session.cards) return;
   const ok = document.createElement('span');
-  ok.textContent = `${job.succeeded} read`;
+  ok.textContent = `${session.succeeded} read`;
   node.append(ok);
-  if (job.failed) {
+  if (session.failed) {
     const bad = document.createElement('span');
     bad.className = 'bad';
-    bad.textContent = `${job.failed} flagged`;
+    bad.textContent = `${session.failed} flagged`;
     node.append(bad);
   }
 }
 
-async function loadRuns({ append = false } = {}) {
+async function loadSessions({ append = false } = {}) {
   const query = append && nextCursor ? `?cursor=${encodeURIComponent(nextCursor)}` : '';
   let data;
   try {
-    const response = await api(`/api/jobs${query}`);
+    const response = await api(`/api/sessions${query}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     data = await response.json();
   } catch {
-    /* A history panel that cannot load is not worth interrupting the app for —
+    /* A history panel that cannot load is not worth interrupting the app for:
        the user came here to extract cards, and that still works. */
     return;
   }
 
   if (!append) runsList.replaceChildren();
-  data.jobs.forEach((job) => runsList.append(buildRunRow(job)));
+  data.sessions.forEach((session) => runsList.append(buildSessionRow(session)));
 
   nextCursor = data.next_cursor;
   runsMore.hidden = !nextCursor;
   runsEmpty.hidden = runsList.children.length > 0;
+  markActiveSession();
 }
 
-/** Patch the running job's row from poll data — no extra request. */
-function refreshRunningRow(job) {
-  const row = runsList.querySelector(`.run[data-job-id="${job.job_id}"]`);
-  if (!row) return;
-  const stats = row.querySelector('[data-role="stats"]');
-  if (stats) paintStats(stats, job);
+function markActiveSession() {
+  runsList.querySelectorAll('.run').forEach((node) => {
+    node.classList.toggle('is-active', node.dataset.sessionId === openSessionId);
+    node.classList.toggle('is-current', node.dataset.sessionId === currentSessionId);
+  });
+}
+
+/** Open a brand-new, empty session and clear the thread. */
+async function startNewSession() {
+  closeSidebarOnNarrow();
+  let session;
+  try {
+    const response = await api('/api/sessions', { method: 'POST' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    session = await response.json();
+  } catch (error) {
+    setHint(`Could not start a session: ${error.message}`, true);
+    return;
+  }
+  currentSessionId = session.session_id;
+  openSessionId = session.session_id;
+  thread.replaceChildren();
+  blank.hidden = false;
+  thread.append(blank);
+  liveReply = null;
+  await loadSessions();
+  setHint('New session. Drop cards to begin.');
 }
 
 /**
- * Show one run in the main panel.
+ * Show one session: every upload it contains, oldest first, then one download
+ * covering the whole thing.
  *
- * Deliberately routed through addAssistantTurn() + renderTable() + the same
- * finishing code a live job uses, rather than a second "history view"
- * component. Two renderers for one table is how the two drift: a fix to the
- * flagged-row tint or the textContent discipline lands in one and not the
- * other, and the one that silently keeps the old behaviour is the security-
- * relevant one.
+ * Each job is rendered through the SAME addAssistantTurn + renderTable path a
+ * live job uses. Two renderers for one table is how the flagged-row handling
+ * and the textContent discipline drift apart.
  */
-async function openRun(jobId) {
+async function openSession(sessionId) {
   closeSidebarOnNarrow();
 
-  if (jobId === liveJobId && liveReply) {
-    /* The running job is already on screen and updating itself. Re-rendering
-       it would throw away the live handles the poll is writing into. */
-    openJobId = jobId;
-    markActiveRun();
-    liveReply.card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    return;
-  }
-
-  let job;
+  let session;
   try {
-    const response = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+    const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    job = await response.json();
+    session = await response.json();
   } catch (error) {
-    setHint(`Could not open that run: ${error.message}`, true);
+    setHint(`Could not open that session: ${error.message}`, true);
     return;
   }
 
-  openJobId = jobId;
-  markActiveRun();
+  openSessionId = sessionId;
+  /* Opening a session also makes it the one new uploads join -- which is what
+     "click a chat and keep typing" does, and avoids a state where the visible
+     thread and the upload target are different sessions. */
+  currentSessionId = sessionId;
+  markActiveSession();
 
   blank.hidden = true;
-  thread.replaceChildren();          /* a history view replaces the transcript */
+  thread.replaceChildren();
   liveReply = null;
 
-  const reply = addAssistantTurn();
-  reply.meter.remove();              /* nothing is in progress to meter */
-  paintReplyOutcome(reply, job);     /* NOT finishReply -- see its docstring */
-  renderTable(reply, job.leads);
+  const jobs = session.jobs_detail || [];
+  if (!jobs.length) {
+    blank.hidden = false;
+    thread.append(blank);
+    setHint('This session is empty. Drop cards to begin.');
+    return;
+  }
+
+  jobs.forEach((job) => {
+    const reply = addAssistantTurn();
+    reply.meter.remove();
+    paintReplyOutcome(reply, job);
+    renderTable(reply, job.leads);
+  });
+
+  addSessionDownload(session);
 }
 
-function markActiveRun() {
-  runsList.querySelectorAll('.run').forEach((node) => {
-    node.classList.toggle('is-active', node.dataset.jobId === openJobId);
-  });
+/**
+ * One download for the session, regenerated server-side on every request.
+ *
+ * There is no stored spreadsheet being amended: the file is built from the
+ * session's current leads each time it is asked for, which is why adding cards
+ * to an open session "updates" it. A materialised file would need a cache to
+ * invalidate and could disagree with the database.
+ */
+function addSessionDownload(session) {
+  const wrap = document.createElement('div');
+  wrap.className = 'turn';
+
+  const card = document.createElement('div');
+  card.className = 'card reply';
+
+  const line = document.createElement('div');
+  line.className = 'reply__status';
+  const text = document.createElement('span');
+  const cards = session.cards || 0;
+  text.textContent = cards
+    ? `${plural(cards, 'card')} in this session across ${plural(session.jobs, 'upload')}.`
+    : 'Nothing in this session yet.';
+  line.append(text);
+
+  const actions = document.createElement('div');
+  actions.className = 'reply__actions';
+  if (cards) {
+    const all = document.createElement('button');
+    all.type = 'button';
+    all.className = 'btn btn--primary';
+    all.textContent = 'Download session .xlsx';
+    all.addEventListener('click', () => downloadSessionXlsx(session.session_id, false));
+    actions.append(all);
+
+    if (session.failed) {
+      const clean = document.createElement('button');
+      clean.type = 'button';
+      clean.className = 'btn';
+      clean.textContent = 'Successful rows only';
+      clean.addEventListener('click', () => downloadSessionXlsx(session.session_id, true));
+      actions.append(clean);
+    }
+  }
+
+  card.append(line, actions);
+  wrap.append(card);
+  thread.append(wrap);
+}
+
+async function downloadSessionXlsx(sessionId, onlySuccessful) {
+  const query = onlySuccessful ? '?only_successful=true' : '';
+  try {
+    const response = await api(
+      `/api/sessions/${encodeURIComponent(sessionId)}/export.xlsx${query}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `leads-session-${sessionId}.xlsx`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    setHint(`Download failed: ${error.message}`, true);
+  }
 }
 
 /* ---------- sidebar open/close (narrow screens only) --------------------- */
@@ -1188,16 +1319,17 @@ function closeSidebar() {
   el('sidebar-toggle').setAttribute('aria-expanded', 'false');
 }
 /* On a wide screen the panel is permanent, so "close after clicking" would be
-   a jarring no-op. matchMedia keeps that rule in one place rather than
-   duplicating the 60rem breakpoint as a magic number in several handlers. */
+   a jarring no-op. matchMedia keeps the breakpoint in one place rather than
+   repeating 60rem as a magic number across handlers. */
 const wideScreen = window.matchMedia('(min-width: 60rem)');
 function closeSidebarOnNarrow() { if (!wideScreen.matches) closeSidebar(); }
 
 el('sidebar-toggle').addEventListener('click', () =>
   sidebar.classList.contains('is-open') ? closeSidebar() : openSidebar());
 el('sidebar-close').addEventListener('click', closeSidebar);
+el('new-session').addEventListener('click', startNewSession);
 scrim.addEventListener('click', closeSidebar);
-runsMore.addEventListener('click', () => loadRuns({ append: true }));
+runsMore.addEventListener('click', () => loadSessions({ append: true }));
 
 /* ============================================================================
    Lightbox

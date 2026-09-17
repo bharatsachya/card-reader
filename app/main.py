@@ -14,7 +14,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -454,6 +454,7 @@ async def extract_single(
 @app.post("/api/jobs", status_code=202)
 async def create_job(
     files: list[UploadFile] = File(...),
+    session_id: str | None = Form(default=None),
     user: User = Depends(require_user),
 ) -> JSONResponse:
     """
@@ -499,13 +500,32 @@ async def create_job(
             status_code=413, detail="; ".join(rejected) or "no usable files"
         )
 
-    job = await store.create_job(total=len(accepted), user_id=user.id)
+    # SESSION RESOLUTION.
+    #
+    # An upload with no session starts one. That means the API stays usable
+    # with a bare `curl -F files=@card.jpg` -- no ceremony, no "create a
+    # session first" step -- while the UI, which always has a session open,
+    # passes its id and appends to it.
+    #
+    # A session id that is not yours resolves to None and a NEW session is
+    # created rather than raising. Erroring would confirm the id exists, which
+    # is the same enumeration leak the 404-not-403 rule elsewhere avoids.
+    session = None
+    if session_id:
+        session = await store.get_session(session_id, user.id)
+    if session is None:
+        session = await store.create_session(user.id)
+
+    job = await store.create_job(
+        total=len(accepted), user_id=user.id, session_id=session.id
+    )
     schedule_job(job.id, accepted, batch_dir)
 
     return JSONResponse(
         status_code=202,
         content={
             "job_id": job.id,
+            "session_id": session.id,
             "status": job.status,
             "accepted": len(accepted),
             "rejected": rejected,
@@ -534,6 +554,103 @@ async def get_job(
     if job is None or not job.owned_by(user.id):
         raise HTTPException(status_code=404, detail=f"unknown job: {job_id}")
     return job.summary() if summary else job.to_dict()
+
+
+# --------------------------------------------------------------------------
+# Sessions
+#
+# A session is a named container for however many uploads it took to collect a
+# set of cards -- the unit a person actually thinks in ("the cards from this
+# conference"), and therefore the unit the spreadsheet should match. A job is
+# one upload batch, so exporting per job hands someone who shot twelve cards in
+# three goes three files to merge by hand.
+# --------------------------------------------------------------------------
+
+DEFAULT_SESSIONS_PAGE = 20
+MAX_SESSIONS_PAGE = 100
+
+
+@app.post("/api/sessions", status_code=201)
+async def create_session(
+    title: str | None = Form(default=None),
+    user: User = Depends(require_user),
+) -> dict:
+    """Open a new, empty session. 201 because a resource now exists."""
+    session = await store.create_session(user.id, title or "")
+    return session.to_dict()
+
+
+@app.get("/api/sessions")
+async def list_sessions(
+    limit: int = DEFAULT_SESSIONS_PAGE,
+    cursor: str | None = None,
+    user: User = Depends(require_user),
+) -> dict:
+    """That user's sessions, newest first, with rollup counts for the sidebar."""
+    limit = max(1, min(limit, MAX_SESSIONS_PAGE))
+    page = await store.list_sessions(user.id, limit=limit, cursor=cursor)
+    return {
+        "sessions": [session.to_dict() for session in page.sessions],
+        "next_cursor": page.next_cursor,
+    }
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session(
+    session_id: str,
+    user: User = Depends(require_user),
+) -> dict:
+    """
+    One session with every job it contains and every lead in them.
+
+    This is what the UI loads when a session is opened from the history
+    sidebar: the whole conversation, in the order it happened.
+    """
+    session = await store.get_session(session_id, user.id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
+
+    jobs = await store.session_jobs(session_id, user.id)
+
+    # The rollup is derived from the jobs already loaded rather than by asking
+    # the store to aggregate again. list_sessions computes these in SQL because
+    # it renders many sessions and must not load their leads; here the leads
+    # are in hand for the response body anyway, so counting them is free and a
+    # second query would be pure duplication -- and a chance for the two paths
+    # to disagree.
+    leads = [lead for job in jobs for lead in job.leads]
+    session.job_count = len(jobs)
+    session.card_count = len(leads)
+    session.succeeded_count = sum(1 for lead in leads if lead.status == "ok")
+    session.failed_count = sum(1 for lead in leads if lead.status != "ok")
+
+    return {
+        **session.to_dict(),
+        "jobs_detail": [job.to_dict() for job in jobs],
+    }
+
+
+@app.get("/api/sessions/{session_id}/export.xlsx")
+async def export_session(
+    session_id: str,
+    only_successful: bool = False,
+    user: User = Depends(require_user),
+) -> Response:
+    """
+    One spreadsheet for the whole session, however many uploads it took.
+
+    THE FILE IS NOT STORED AND THEN AMENDED -- it is generated from the
+    session's leads on every request. That is why adding cards to an open
+    session "updates" the spreadsheet: there is no earlier file to go stale,
+    so the download is always exactly the session's current contents. Keeping
+    a materialised .xlsx on disk would mean a cache to invalidate, a partial
+    file to serve during a rebuild, and a way for the two to disagree.
+    """
+    session = await store.get_session(session_id, user.id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"unknown session: {session_id}")
+    leads = await store.session_leads(session_id, user.id)
+    return _xlsx_response(_filter(leads, only_successful), f"leads-session-{session_id}")
 
 
 @app.get("/api/leads/{lead_id}/image")

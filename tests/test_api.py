@@ -206,3 +206,91 @@ async def test_a_forged_token_is_rejected(client, monkeypatch):
         "/api/jobs", headers={"Authorization": f"Bearer {forged}"}
     )
     assert response.status_code == 401
+
+
+# --- sessions -------------------------------------------------------------
+
+async def test_two_uploads_in_one_session_make_one_spreadsheet(client):
+    """
+    The feature, stated as a test: upload twice into the same session and the
+    session export contains everything, rather than two files to merge.
+    """
+    import openpyxl
+
+    created = await client.post("/api/sessions")
+    assert created.status_code == 201
+    session_id = created.json()["session_id"]
+    assert created.json()["title"], "a session needs a readable default title"
+
+    first = [("files", ("a.jpg", card_bytes(), "image/jpeg"))]
+    await run_job_to_completion(client, first + [("session_id", (None, session_id))])
+
+    second = [("files", ("b.jpg", card_bytes(), "image/jpeg")),
+              ("files", ("c.jpg", card_bytes(), "image/jpeg"))]
+    await run_job_to_completion(client, second + [("session_id", (None, session_id))])
+
+    detail = (await client.get(f"/api/sessions/{session_id}")).json()
+    assert detail["jobs"] == 2, "both uploads belong to the session"
+    assert detail["cards"] == 3
+
+    export = await client.get(f"/api/sessions/{session_id}/export.xlsx")
+    assert export.status_code == 200
+    sheet = openpyxl.load_workbook(io.BytesIO(export.content)).active
+    # header + one row per card, from BOTH uploads
+    assert sheet.max_row == 4, f"expected 3 data rows, got {sheet.max_row - 1}"
+
+
+async def test_an_upload_without_a_session_opens_one(client):
+    """A bare curl must still work -- no "create a session first" ceremony."""
+    files = [("files", ("a.jpg", card_bytes(), "image/jpeg"))]
+    response = await client.post("/api/jobs", files=files)
+    assert response.status_code == 202
+    assert response.json()["session_id"], "the server must say where it landed"
+
+
+async def test_a_foreign_session_id_does_not_leak_or_crash(client):
+    """
+    Posting someone else's session id opens a fresh one rather than erroring.
+    Rejecting it would confirm the id exists, which is the enumeration leak the
+    404-not-403 rule elsewhere exists to prevent.
+    """
+    def as_user(uid):
+        return lambda: User(id=uid, email=None)
+
+    app.dependency_overrides[require_user] = as_user("alice")
+    try:
+        alice_session = (await client.post("/api/sessions")).json()["session_id"]
+
+        app.dependency_overrides[require_user] = as_user("bob")
+        files = [("files", ("a.jpg", card_bytes(), "image/jpeg"))]
+        response = await client.post(
+            "/api/jobs",
+            files=files + [("session_id", (None, alice_session))],
+        )
+        assert response.status_code == 202
+        assert response.json()["session_id"] != alice_session, "BOB JOINED ALICE'S SESSION"
+
+        assert (await client.get(f"/api/sessions/{alice_session}")).status_code == 404
+        assert (await client.get(
+            f"/api/sessions/{alice_session}/export.xlsx")).status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_sessions_list_is_paginated_and_scoped(client):
+    def as_user(uid):
+        return lambda: User(id=uid, email=None)
+
+    app.dependency_overrides[require_user] = as_user("carol")
+    try:
+        for _ in range(3):
+            await client.post("/api/sessions")
+        page = (await client.get("/api/sessions?limit=2")).json()
+        assert len(page["sessions"]) == 2
+        assert page["next_cursor"]
+        rest = (await client.get(
+            f"/api/sessions?limit=2&cursor={page['next_cursor']}")).json()
+        assert len(rest["sessions"]) == 1
+        assert rest["next_cursor"] is None
+    finally:
+        app.dependency_overrides.clear()

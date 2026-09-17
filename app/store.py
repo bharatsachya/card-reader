@@ -56,6 +56,73 @@ def _now() -> str:
 
 
 @dataclass
+class Session:
+    """
+    One working session: a named container for however many uploads it took.
+
+    WHY THIS EXISTS. A Job is one upload batch, so exporting per job means
+    someone who photographed twelve cards in three goes gets three spreadsheets
+    to merge by hand. The other endpoint exports every lead the account has
+    ever produced, which is the opposite problem. A session is the unit people
+    actually think in -- "the cards I collected at this conference" -- and it
+    is the unit the spreadsheet should match.
+
+    The analogy is a chat thread: you open a new one when you start something
+    new, and everything you add while it is open belongs to it.
+    """
+
+    id: str
+    user_id: str = "local"
+    title: str = ""
+    created_at: str = field(default_factory=_now)
+    # Bumped whenever a job is added, so the UI can show "last active" without
+    # a join onto jobs. NOT used for ordering -- see list_sessions.
+    updated_at: str = field(default_factory=_now)
+
+    # Filled by list_sessions so the sidebar can render a row without a
+    # second query per session. None means "not supplied".
+    job_count: Optional[int] = None
+    card_count: Optional[int] = None
+    succeeded_count: Optional[int] = None
+    failed_count: Optional[int] = None
+    thumbnail_lead_ids: list[str] = field(default_factory=list)
+
+    def owned_by(self, user_id: str) -> bool:
+        return self.user_id == user_id
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.id,
+            "title": self.title,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "jobs": self.job_count or 0,
+            "cards": self.card_count or 0,
+            "succeeded": self.succeeded_count or 0,
+            "failed": self.failed_count or 0,
+            "thumbnails": self.thumbnail_lead_ids,
+        }
+
+
+@dataclass
+class SessionPage:
+    sessions: list[Session]
+    next_cursor: Optional[str] = None
+
+
+def default_session_title(when: Optional[str] = None) -> str:
+    """
+    A readable default, e.g. "18 Sep 2026, 14:32".
+
+    Named rather than left blank because an untitled row in a history list is
+    indistinguishable from every other untitled row, and the timestamp is the
+    one thing that is always true and always different.
+    """
+    stamp = datetime.fromisoformat(when) if when else datetime.now(timezone.utc)
+    return stamp.strftime("%d %b %Y, %H:%M")
+
+
+@dataclass
 class Job:
     """
     One bulk upload and its progress.
@@ -67,6 +134,9 @@ class Job:
 
     id: str
     total: int                          # how many files were accepted
+    # Which session this upload belongs to. Nullable so that rows created
+    # before sessions existed keep working; the migration backfills them.
+    session_id: Optional[str] = None
     # Who owns this job. Ownership is enforced on every read (see get_job in
     # main.py): without it, guessing a job id would expose someone else's
     # leads. A field on the row is also exactly how this works once the store
@@ -138,6 +208,7 @@ class Job:
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "thumbnails": self.thumbnail_lead_ids,
+            "session_id": self.session_id,
         }
 
     def to_dict(self) -> dict:
@@ -197,7 +268,9 @@ class LeadStore(ABC):
     """
 
     @abstractmethod
-    async def create_job(self, total: int, user_id: str = "local") -> Job:
+    async def create_job(
+        self, total: int, user_id: str = "local", session_id: Optional[str] = None
+    ) -> Job:
         """Register a new job and return it."""
 
     @abstractmethod
@@ -245,6 +318,45 @@ class LeadStore(ABC):
     @abstractmethod
     async def all_leads(self, user_id: str) -> list[Lead]:
         """Every lead that user owns (used by the 'export everything' path)."""
+
+    # --- Sessions ---------------------------------------------------------
+
+    @abstractmethod
+    async def create_session(self, user_id: str, title: str = "") -> Session:
+        """Open a new session. Empty until a job is added to it."""
+
+    @abstractmethod
+    async def get_session(self, session_id: str, user_id: str) -> Optional[Session]:
+        """One session, but only if `user_id` owns it. None otherwise."""
+
+    @abstractmethod
+    async def list_sessions(
+        self,
+        user_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> SessionPage:
+        """
+        That user's sessions, newest first, with rollup counts.
+
+        ORDERED BY created_at, NOT updated_at. Sorting by last activity is the
+        more familiar behaviour, but it makes a row move while someone is
+        paginating past it -- the cursor names a position in an order that just
+        changed, so a session can be shown twice or skipped. created_at never
+        changes, so the order is stable. The cost is that adding cards to an
+        old session does not float it to the top; `updated_at` is still
+        returned so the UI can show when it was last touched.
+        """
+
+    @abstractmethod
+    async def session_leads(self, session_id: str, user_id: str) -> list[Lead]:
+        """Every lead in a session, in the order they were extracted."""
+
+    @abstractmethod
+    async def session_jobs(self, session_id: str, user_id: str) -> list[Job]:
+        """Every job in a session, oldest first, each with its leads."""
+
+    # --- Leads ------------------------------------------------------------
 
     @abstractmethod
     async def get_lead(self, lead_id: str, user_id: str) -> Optional[Lead]:
@@ -327,10 +439,91 @@ class InMemoryLeadStore(LeadStore):
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
+        self._sessions: dict[str, Session] = {}
         self._lock = asyncio.Lock()
 
-    async def create_job(self, total: int, user_id: str = "local") -> Job:
-        job = Job(id=uuid.uuid4().hex[:12], total=total, user_id=user_id)
+    # --- sessions ---------------------------------------------------------
+
+    async def create_session(self, user_id: str, title: str = "") -> Session:
+        session = Session(
+            id=uuid.uuid4().hex[:12],
+            user_id=user_id,
+            title=title or default_session_title(),
+        )
+        async with self._lock:
+            self._sessions[session.id] = session
+        return session
+
+    async def get_session(self, session_id: str, user_id: str) -> Optional[Session]:
+        async with self._lock:
+            session = self._sessions.get(session_id)
+        return session if session and session.owned_by(user_id) else None
+
+    async def list_sessions(
+        self,
+        user_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> SessionPage:
+        async with self._lock:
+            ordered = sorted(
+                (s for s in self._sessions.values() if s.user_id == user_id),
+                key=lambda s: (s.created_at, s.id),
+                reverse=True,
+            )
+            jobs = list(self._jobs.values())
+
+        if cursor:
+            position = decode_cursor(cursor)
+            if position:
+                ordered = [s for s in ordered if (s.created_at, s.id) < position]
+
+        for session in ordered:
+            owned = [j for j in jobs if j.session_id == session.id]
+            leads = [lead for j in owned for lead in j.leads]
+            session.job_count = len(owned)
+            session.card_count = len(leads)
+            session.succeeded_count = sum(1 for x in leads if x.status == "ok")
+            session.failed_count = sum(1 for x in leads if x.status != "ok")
+            session.thumbnail_lead_ids = [
+                x.id for x in leads if x.image_sha256 and x.id
+            ][:THUMBNAILS_PER_JOB]
+
+        if limit is None:
+            return SessionPage(sessions=ordered)
+        page, has_more = ordered[:limit], len(ordered) > limit
+        return SessionPage(
+            sessions=page,
+            next_cursor=(
+                encode_cursor(page[-1]) if has_more and page else None
+            ),
+        )
+
+    async def session_jobs(self, session_id: str, user_id: str) -> list[Job]:
+        if await self.get_session(session_id, user_id) is None:
+            return []
+        async with self._lock:
+            return sorted(
+                (j for j in self._jobs.values() if j.session_id == session_id),
+                key=lambda j: (j.created_at, j.id),
+            )
+
+    async def session_leads(self, session_id: str, user_id: str) -> list[Lead]:
+        return [lead for job in await self.session_jobs(session_id, user_id)
+                for lead in job.leads]
+
+    # --- jobs -------------------------------------------------------------
+
+    async def create_job(
+        self, total: int, user_id: str = "local", session_id: Optional[str] = None
+    ) -> Job:
+        job = Job(id=uuid.uuid4().hex[:12], total=total, user_id=user_id,
+                  session_id=session_id)
+        if session_id:
+            async with self._lock:
+                session = self._sessions.get(session_id)
+                if session:
+                    session.updated_at = _now()
         async with self._lock:
             self._jobs[job.id] = job
             self._prune_locked()
@@ -494,9 +687,24 @@ class InMemoryLeadStore(LeadStore):
 # Note that SQLite only ENFORCES this if `PRAGMA foreign_keys = ON` is set on
 # the connection -- see _connect() below, and note it is off by default.
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id         TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user_created
+    ON sessions (user_id, created_at DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT    PRIMARY KEY,
     user_id     TEXT    NOT NULL,
+    -- Which session this upload belongs to. Nullable because a database
+    -- created before sessions existed has jobs without one, and the migration
+    -- backfills them rather than refusing to open the file.
+    session_id  TEXT    REFERENCES sessions(id) ON DELETE CASCADE,
     total       INTEGER NOT NULL,
     status      TEXT    NOT NULL,
     error       TEXT,
@@ -542,6 +750,7 @@ CREATE TABLE IF NOT EXISTS leads (
 -- list_jobs() uses. Without it, rendering the history sidebar is a full scan
 -- of the leads table per job.
 CREATE INDEX IF NOT EXISTS idx_leads_job ON leads (job_id);
+
 """
 
 # The lead columns, in one place, so the INSERT, the SELECT and the row->Lead
@@ -653,6 +862,55 @@ class SqliteLeadStore(LeadStore):
                     f"ALTER TABLE leads ADD COLUMN {column} {definition}"
                 )
 
+        async with conn.execute("PRAGMA table_info(jobs)") as cursor:
+            job_columns = {row[1] for row in await cursor.fetchall()}
+        if "session_id" not in job_columns:
+            # No REFERENCES clause here on purpose: SQLite's ALTER TABLE ADD
+            # COLUMN cannot add a column with a foreign key constraint. The
+            # constraint is declared in _SCHEMA for databases created fresh;
+            # on an upgraded one the column exists without it, which is a
+            # known and acceptable asymmetry -- the application never orphans
+            # a job, and pretending otherwise would mean rebuilding the table.
+            await conn.execute("ALTER TABLE jobs ADD COLUMN session_id TEXT")
+
+            # BACKFILL: give every pre-existing job its own session, so nothing
+            # is stranded outside the new model. One session per job preserves
+            # exactly what those users saw before -- their old uploads each
+            # export as their own spreadsheet, which is what they were.
+            async with conn.execute(
+                "SELECT id, user_id, created_at FROM jobs WHERE session_id IS NULL"
+            ) as cursor:
+                orphans = await cursor.fetchall()
+            for job_id, user_id, created_at in orphans:
+                session_id = uuid.uuid4().hex[:12]
+                await conn.execute(
+                    "INSERT INTO sessions (id, user_id, title, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (session_id, user_id, default_session_title(created_at),
+                     created_at, created_at),
+                )
+                await conn.execute(
+                    "UPDATE jobs SET session_id = ? WHERE id = ?",
+                    (session_id, job_id),
+                )
+
+        # CREATED HERE, NOT IN _SCHEMA, AND THIS ORDERING IS THE WHOLE POINT.
+        #
+        # _SCHEMA runs first and its CREATE TABLE is "IF NOT EXISTS", so on a
+        # database that predates sessions the jobs table is left exactly as it
+        # was -- without session_id. An index on that column therefore cannot
+        # live in _SCHEMA: it would be executed before the column exists and
+        # fail with "no such column", which breaks opening every existing
+        # database while working perfectly on a fresh one. That is the worst
+        # shape of bug, because development and CI both start from empty.
+        #
+        # Here it runs after the ALTER TABLE above, so the column exists in
+        # both cases. "every job in this session" backs the session view and
+        # the session export; without it each is a full scan of jobs.
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs (session_id)"
+        )
+
     @asynccontextmanager
     async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
         """A ready connection with the per-connection pragmas applied."""
@@ -688,6 +946,7 @@ class SqliteLeadStore(LeadStore):
         job = Job(
             id=row["id"],
             total=row["total"],
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
             user_id=row["user_id"],
             status=row["status"],
             error=row["error"],
@@ -705,15 +964,181 @@ class SqliteLeadStore(LeadStore):
     async def initialize(self) -> None:
         await self._ensure_ready()
 
-    async def create_job(self, total: int, user_id: str = "local") -> Job:
-        job = Job(id=uuid.uuid4().hex[:12], total=total, user_id=user_id)
+    # --- sessions ---------------------------------------------------------
+
+    async def create_session(self, user_id: str, title: str = "") -> Session:
+        session = Session(
+            id=uuid.uuid4().hex[:12],
+            user_id=user_id,
+            title=title or default_session_title(),
+        )
+        async with self._connect() as conn:
+            await conn.execute(
+                "INSERT INTO sessions (id, user_id, title, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?)",
+                (session.id, session.user_id, session.title,
+                 session.created_at, session.updated_at),
+            )
+            await conn.commit()
+        return session
+
+    async def get_session(self, session_id: str, user_id: str) -> Optional[Session]:
+        # Ownership is in the WHERE clause, not a check afterwards -- the same
+        # discipline as get_lead. A missing check becomes a missing argument.
+        async with self._connect() as conn:
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        return Session(
+            id=row["id"], user_id=row["user_id"], title=row["title"],
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    async def list_sessions(
+        self,
+        user_id: str,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> SessionPage:
+        # One aggregate for the whole page rather than a query per session.
+        # Counting leads means going through jobs, so this is a two-level
+        # rollup done in SQL instead of in Python over hydrated rows.
+        query = """
+            SELECT s.*,
+                   COALESCE(c.jobs, 0)      AS job_count,
+                   COALESCE(c.cards, 0)     AS card_count,
+                   COALESCE(c.succeeded, 0) AS succeeded_count,
+                   COALESCE(c.failed, 0)    AS failed_count
+            FROM sessions s
+            LEFT JOIN (
+                SELECT j.session_id,
+                       COUNT(DISTINCT j.id)                              AS jobs,
+                       COUNT(l.id)                                       AS cards,
+                       SUM(CASE WHEN l.status  = 'ok' THEN 1 ELSE 0 END) AS succeeded,
+                       SUM(CASE WHEN l.status <> 'ok' AND l.id IS NOT NULL
+                                THEN 1 ELSE 0 END)                       AS failed
+                FROM jobs j
+                LEFT JOIN leads l ON l.job_id = j.id
+                GROUP BY j.session_id
+            ) c ON c.session_id = s.id
+            WHERE s.user_id = ?
+              {keyset}
+            ORDER BY s.created_at DESC, s.id DESC
+            {limit_clause}
+        """
+        params: list = [user_id]
+        position = decode_cursor(cursor) if cursor else None
+        if position:
+            query = query.replace(
+                "{keyset}",
+                "AND (s.created_at < ? OR (s.created_at = ? AND s.id < ?))")
+            params += [position[0], position[0], position[1]]
+        else:
+            query = query.replace("{keyset}", "")
+        if limit is None:
+            query = query.replace("{limit_clause}", "")
+        else:
+            query = query.replace("{limit_clause}", "LIMIT ?")
+            params.append(limit + 1)
+
+        async with self._connect() as conn:
+            async with conn.execute(query, params) as db_cursor:
+                rows = await db_cursor.fetchall()
+            sessions = [
+                Session(
+                    id=r["id"], user_id=r["user_id"], title=r["title"],
+                    created_at=r["created_at"], updated_at=r["updated_at"],
+                    job_count=r["job_count"], card_count=r["card_count"],
+                    succeeded_count=r["succeeded_count"],
+                    failed_count=r["failed_count"],
+                )
+                for r in rows
+            ]
+            has_more = limit is not None and len(sessions) > limit
+            if has_more:
+                sessions = sessions[:limit]
+
+            if sessions:
+                placeholders = ", ".join("?" * len(sessions))
+                by_id = {s.id: s for s in sessions}
+                async with conn.execute(
+                    f"SELECT j.session_id, l.id FROM leads l "
+                    f"JOIN jobs j ON j.id = l.job_id "
+                    f"WHERE j.session_id IN ({placeholders}) "
+                    f"AND l.image_sha256 IS NOT NULL ORDER BY l.rowid",
+                    tuple(by_id),
+                ) as db_cursor:
+                    for session_id, lead_id in await db_cursor.fetchall():
+                        bucket = by_id[session_id].thumbnail_lead_ids
+                        if len(bucket) < THUMBNAILS_PER_JOB:
+                            bucket.append(lead_id)
+
+        return SessionPage(
+            sessions=sessions,
+            next_cursor=(
+                encode_cursor(sessions[-1]) if has_more and sessions else None
+            ),
+        )
+
+    async def session_jobs(self, session_id: str, user_id: str) -> list[Job]:
+        # The JOIN onto sessions is the authorisation: no row comes back
+        # unless this user owns the session the job hangs off.
+        query = """
+            SELECT j.* FROM jobs j
+            JOIN sessions s ON s.id = j.session_id
+            WHERE j.session_id = ? AND s.user_id = ?
+            ORDER BY j.created_at, j.id
+        """
+        async with self._connect() as conn:
+            async with conn.execute(query, (session_id, user_id)) as cursor:
+                jobs = [self._row_to_job(r, with_counts=False)
+                        for r in await cursor.fetchall()]
+            for job in jobs:
+                async with conn.execute(
+                    "SELECT * FROM leads WHERE job_id = ? ORDER BY rowid",
+                    (job.id,),
+                ) as cursor:
+                    job.leads = [self._row_to_lead(r)
+                                 for r in await cursor.fetchall()]
+        return jobs
+
+    async def session_leads(self, session_id: str, user_id: str) -> list[Lead]:
+        query = """
+            SELECT l.* FROM leads l
+            JOIN jobs j     ON j.id = l.job_id
+            JOIN sessions s ON s.id = j.session_id
+            WHERE j.session_id = ? AND s.user_id = ?
+            ORDER BY j.created_at, l.rowid
+        """
+        async with self._connect() as conn:
+            async with conn.execute(query, (session_id, user_id)) as cursor:
+                return [self._row_to_lead(r) for r in await cursor.fetchall()]
+
+    # --- jobs -------------------------------------------------------------
+
+    async def create_job(
+        self, total: int, user_id: str = "local", session_id: Optional[str] = None
+    ) -> Job:
+        job = Job(id=uuid.uuid4().hex[:12], total=total, user_id=user_id,
+                  session_id=session_id)
         async with self._connect() as conn:
             await conn.execute(
                 "INSERT INTO jobs (id, user_id, total, status, error, "
-                "created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "created_at, finished_at, session_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (job.id, job.user_id, job.total, job.status, job.error,
-                 job.created_at, job.finished_at),
+                 job.created_at, job.finished_at, job.session_id),
             )
+            if session_id:
+                # "Last active" for the sidebar. Not used for ordering.
+                await conn.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (_now(), session_id),
+                )
             await conn.commit()
         return job
 

@@ -158,3 +158,78 @@ async def test_thumbnails_only_include_leads_that_have_images(store):
     await store.append_lead(job.id, Lead(first_name="B"))
     page = await store.list_jobs("u1", limit=10)
     assert page.jobs[0].thumbnail_lead_ids == [with_image.id]
+
+
+# --- sessions -------------------------------------------------------------
+#
+# A session groups however many uploads it took to collect a set of cards, so
+# one spreadsheet covers the lot. These run against both backends like
+# everything else above.
+
+async def test_a_session_collects_jobs_from_several_uploads(store):
+    session = await store.create_session("u1")
+    assert session.title, "a session must have a readable default title"
+
+    first = await store.create_job(total=1, user_id="u1", session_id=session.id)
+    await store.append_lead(first.id, Lead(first_name="A", source_filename="a.jpg"))
+    second = await store.create_job(total=2, user_id="u1", session_id=session.id)
+    await store.append_lead(second.id, Lead(first_name="B", source_filename="b.jpg"))
+    await store.append_lead(second.id, Lead(source_filename="c.jpg",
+                                            status="parse_error", error="x"))
+
+    jobs = await store.session_jobs(session.id, "u1")
+    assert [j.id for j in jobs] == [first.id, second.id], "oldest upload first"
+
+    # THE POINT OF THE FEATURE: one flat list across every upload, in order.
+    leads = await store.session_leads(session.id, "u1")
+    assert [lead.source_filename for lead in leads] == ["a.jpg", "b.jpg", "c.jpg"]
+
+
+async def test_session_rollup_counts_span_all_its_jobs(store):
+    session = await store.create_session("u1")
+    for name, status in [("a", "ok"), ("b", "ok"), ("c", "parse_error")]:
+        job = await store.create_job(total=1, user_id="u1", session_id=session.id)
+        await store.append_lead(job.id, Lead(source_filename=name, status=status))
+
+    page = await store.list_sessions("u1", limit=10)
+    row = page.sessions[0].to_dict()
+    assert row["jobs"] == 3
+    assert row["cards"] == 3
+    assert row["succeeded"] == 2
+    assert row["failed"] == 1
+
+
+async def test_an_empty_session_lists_with_zero_counts(store):
+    # A session opened but not yet used must still appear, or "New session"
+    # looks broken until the first upload finishes.
+    await store.create_session("u1")
+    page = await store.list_sessions("u1", limit=10)
+    assert len(page.sessions) == 1
+    assert page.sessions[0].to_dict()["cards"] == 0
+
+
+async def test_sessions_are_isolated_between_users(store):
+    mine = await store.create_session("alice")
+    job = await store.create_job(total=1, user_id="alice", session_id=mine.id)
+    await store.append_lead(job.id, Lead(first_name="Alice"))
+    await store.create_session("bob")
+
+    assert await store.get_session(mine.id, "bob") is None, "BOB READ ALICE'S SESSION"
+    assert await store.session_leads(mine.id, "bob") == [], "BOB READ ALICE'S LEADS"
+    assert await store.session_jobs(mine.id, "bob") == []
+
+    bob_page = await store.list_sessions("bob", limit=10)
+    assert all(s.id != mine.id for s in bob_page.sessions)
+
+
+async def test_session_pagination_is_stable(store):
+    created = [(await store.create_session("u1")).id for _ in range(12)]
+    seen, cursor = [], None
+    while True:
+        page = await store.list_sessions("u1", limit=5, cursor=cursor)
+        seen += [s.id for s in page.sessions]
+        if not page.next_cursor:
+            break
+        cursor = page.next_cursor
+    assert seen == list(reversed(created))
+    assert len(seen) == len(set(seen))
