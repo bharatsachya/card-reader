@@ -386,10 +386,17 @@ def main() -> int:
                 # cached is printed on every line, not just when it trips the
                 # threshold: a number you can see is a number you can sanity
                 # check, and a silent cache is how fake results survive review.
+                # flush=True is not cosmetic. Redirected to a file, Python
+                # block-buffers stdout, so a run that takes an hour writes
+                # nothing until it finishes -- and a run interrupted at 15
+                # minutes loses every measurement it had already taken. That
+                # happened once; each line now lands as it is produced, so
+                # partial results survive a Ctrl-C.
                 print(f"  {config:<22} {card['id']:<18} {size[0]}x{size[1]:<6} "
                       f"{elapsed:6.1f}s  {usage['prompt_tokens']:>5} tok "
                       f"(cached {usage['cached_tokens']:>4}) "
-                      f"{got}/7" + (f"  wrong: {','.join(wrong)}" if wrong else ""))
+                      f"{got}/7" + (f"  wrong: {','.join(wrong)}" if wrong else ""),
+                      flush=True)
                 cached_seen.append(usage["cached_tokens"])
 
         rows.append({
