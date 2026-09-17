@@ -53,7 +53,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 # would invalidate that layer on every single edit and reinstall all ten
 # packages every time.
 COPY requirements.txt .
-RUN pip install --require-hashes=false -r requirements.txt
+RUN pip install -r requirements.txt
 
 
 # -----------------------------------------------------------------------------
