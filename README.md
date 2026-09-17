@@ -480,18 +480,28 @@ Ollama unloads an idle model after 5 minutes by default, so the next card pays
 a 3.2 GB reload on top of inference. `OLLAMA_KEEP_ALIVE=-1` is set by
 `deploy/deploy.sh`.
 
-| condition | wall time |
-|---|---|
-| cold — first card after a reboot, model not loaded | **181 s** |
-| warm — model resident | **167 s** |
+Measured over the **same six real cards** in both conditions, so the only
+variable is whether the model was resident. `--cold-each` evicts the model
+before every card, which also clears the prompt cache — every cold measurement
+below reports `cached_tokens = 0`, so none of them is a cache artefact.
 
-≈ **14 s** of reload amortised away per idle gap. On a box where cards arrive
-in bursts minutes apart, that reload was being paid repeatedly for no reason;
-the machine has 7.6 GiB and nothing else wants the RAM.
+| condition | median | range | fields correct |
+|---|---|---|---|
+| **cold** — model evicted before each card | **156 s** | 151–160 s | 35/42 |
+| **warm** — model resident | **143 s** | 137–148 s | 35/42 |
 
-*These two figures are incidental — taken during deployment verification rather
-than from a controlled run of five cold against five warm. They are consistent
-with the mechanism but they are a sample of one each, and are labelled as such.*
+**≈ 13 s saved per idle gap**, which is the cost of reading 3.2 GB back in.
+Accuracy is identical in both conditions, as it must be — residency cannot
+change what the model reads, and seeing that come out equal is a check on the
+harness rather than a finding.
+
+On a box where cards arrive in bursts minutes apart, the default 5-minute
+unload meant paying that reload repeatedly for no reason; the machine has
+7.6 GiB and nothing else wants the RAM.
+
+*An earlier, incidental pair of figures (181 s cold after a reboot against
+167 s warm) appeared during deployment verification. They pointed the same way
+but were a sample of one each; the table above replaces them.*
 
 ### A3 — Card detection and perspective crop
 
