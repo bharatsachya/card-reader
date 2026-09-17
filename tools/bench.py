@@ -59,6 +59,21 @@ class CacheHit(RuntimeError):
     """A measurement was served from the prompt cache and is therefore fiction."""
 
 
+# What counts as "this timing is fiction".
+#
+# MEASURED, NOT ASSUMED. The first version of this check demanded
+# cached_tokens == 0 and aborted immediately on a legitimate run: Ollama had
+# cached 299 of 1341 tokens, which is the SYSTEM PROMPT -- identical on every
+# request by construction, since prompt.py generates it from LEAD_FIELDS. The
+# 1042 image tokens were still computed from scratch, so the timing was real.
+#
+# The failure mode that actually matters is the whole prompt being cached: the
+# same image sent twice returns ~1116 of 1117 tokens cached and 22s instead of
+# 172s. That is what this threshold catches. Anything above 60% means image
+# tokens are being reused, which only happens if the image repeated.
+CACHE_HIT_FRACTION = 0.60
+
+
 # --------------------------------------------------------------------------
 # preprocessing -- deliberately mirrors app/imaging.py, parameterised by edge
 # --------------------------------------------------------------------------
@@ -139,12 +154,16 @@ def call_model(url: str, model: str, jpeg: bytes, max_tokens: int,
         print("    raw usage:", json.dumps(body.get("usage", {}), indent=6))
 
     usage = _usage(body)
-    if usage["cached_tokens"]:
+    prompt_tokens = usage["prompt_tokens"] or 1
+    cached_fraction = usage["cached_tokens"] / prompt_tokens
+    if cached_fraction >= CACHE_HIT_FRACTION:
         raise CacheHit(
             f"cached_tokens={usage['cached_tokens']} of "
-            f"prompt_tokens={usage['prompt_tokens']} -- this timing is a cache "
-            f"hit, not an inference. Use distinct images or reset the cache."
+            f"prompt_tokens={usage['prompt_tokens']} ({cached_fraction:.0%}) -- "
+            f"the image itself was served from cache, so this timing is not an "
+            f"inference. Use distinct images or reset the cache."
         )
+    usage["cached_fraction"] = cached_fraction
     content = body["choices"][0]["message"]["content"]
     return content, usage, elapsed
 
@@ -238,9 +257,9 @@ def load_cards(directory: pathlib.Path) -> list[dict]:
 
 def markdown_table(rows: list[dict], baseline_seconds: float | None) -> str:
     header = (
-        "| config | px sent | prompt tok | completion tok | "
+        "| config | px sent | prompt tok | cached tok | completion tok | "
         "median s | min–max s | fields ok | vs baseline |\n"
-        "|---|---|---|---|---|---|---|---|\n"
+        "|---|---|---|---|---|---|---|---|---|\n"
     )
     lines = []
     for row in rows:
@@ -252,7 +271,7 @@ def markdown_table(rows: list[dict], baseline_seconds: float | None) -> str:
             delta = f"{change:+.0f}%" if abs(change) >= 1 else "—"
         lines.append(
             f"| {row['config']} | {row['px']} | {row['prompt_tokens']:,} | "
-            f"{row['completion_tokens']} | **{median:.0f}** | "
+            f"{row['cached']} | {row['completion_tokens']} | **{median:.0f}** | "
             f"{min(times):.0f}–{max(times):.0f} | "
             f"{row['correct']}/{row['possible']} ({row['correct']/row['possible']*100:.0f}%) | "
             f"{delta} |"
@@ -288,6 +307,7 @@ def main() -> int:
     for edge in [int(e) for e in args.edges.split(",")]:
         config = f"{args.label + ' ' if args.label else ''}{edge}px{' +crop' if args.crop else ''}"
         times, prompts, completions, correct, sizes = [], [], [], 0, []
+        cached_seen = []
 
         for repeat in range(args.repeat):
             if repeat:
@@ -314,9 +334,14 @@ def main() -> int:
                 prompts.append(usage["prompt_tokens"])
                 completions.append(usage["completion_tokens"])
 
+                # cached is printed on every line, not just when it trips the
+                # threshold: a number you can see is a number you can sanity
+                # check, and a silent cache is how fake results survive review.
                 print(f"  {config:<22} {card['id']:<18} {size[0]}x{size[1]:<6} "
-                      f"{elapsed:6.1f}s  {usage['prompt_tokens']:>5} tok  "
+                      f"{elapsed:6.1f}s  {usage['prompt_tokens']:>5} tok "
+                      f"(cached {usage['cached_tokens']:>4}) "
                       f"{got}/7" + (f"  wrong: {','.join(wrong)}" if wrong else ""))
+                cached_seen.append(usage["cached_tokens"])
 
         rows.append({
             "config": config,
@@ -327,6 +352,7 @@ def main() -> int:
             "times": times,
             "correct": correct,
             "possible": len(cards) * len(LEAD_FIELDS) * args.repeat,
+            "cached": round(statistics.mean(cached_seen)) if cached_seen else 0,
         })
 
     table = markdown_table(rows, args.baseline)
