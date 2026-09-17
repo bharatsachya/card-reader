@@ -23,6 +23,14 @@ openpyxl==3.1.5
 # --- Deterministic phone parsing / E164 formatting ---
 phonenumbers==9.0.39
 
+# --- Persistence ---
+# Async SQLite driver. Needed because LeadStore's methods are async: the stdlib
+# `sqlite3` module is blocking, so calling it directly from a coroutine would
+# stall the entire event loop -- including every other card's model call and
+# every poll in flight -- for the duration of each write. aiosqlite runs the
+# same sqlite3 calls on a worker thread and awaits the result.
+aiosqlite==0.22.1
+
 # --- Authentication: verifying Clerk session tokens ---
 # PyJWT does the JWT work; [crypto] pulls in `cryptography` for the RS256
 # signature check. Only PUBLIC keys are used -- see app/auth.py.

@@ -5,13 +5,16 @@ Run it with:  uvicorn app.main:app --reload --port 8000
 "app.main" is the module path, ":app" is the variable below that uvicorn serves.
 """
 
+import logging
 import pathlib
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi import Depends, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app import images
 from app.auth import User, require_user
 from app.config import settings
 from app.excel import build_workbook, export_filename
@@ -27,11 +30,120 @@ from app.uploads import (
     spool_upload,
 )
 
+# APPLICATION LOGGING.
+#
+# uvicorn configures handlers for its OWN loggers and leaves the root logger
+# untouched: level WARNING, no handlers. So log.info() from application code
+# goes nowhere at all, and log.warning() only escapes via Python's lastResort
+# fallback. That is a bad default for messages like "retention deleted 900
+# images" -- operational facts that are worthless if nobody can see them, and
+# actively misleading when their absence reads as "the sweep did not run".
+#
+# One handler on one named logger, rather than logging.basicConfig(): basicConfig
+# mutates the ROOT logger, which is a decision belonging to whoever runs the
+# process, and it silently does nothing when handlers already exist -- so it
+# would work here and quietly stop working under gunicorn or Azure's log
+# collector. The format matches uvicorn's so the two interleave readably.
+log = logging.getLogger("card-reader")
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    # Our handler already prints it; propagating would let the root logger
+    # print it a second time the moment anything configures root.
+    log.propagate = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup and shutdown, run once per process.
+
+    TWO THINGS HAPPEN HERE, AND BOTH ARE ABOUT FAILING AT THE RIGHT MOMENT.
+
+    1. The store is initialised eagerly. Every store method also prepares
+       itself lazily, so this is not strictly required -- but without it, a
+       DB_PATH pointing at an unwritable directory would boot a perfectly
+       healthy-looking container and then fail on the first upload, after the
+       user has already waited through the upload. Doing it here means the
+       process dies at boot, the platform's health probe never goes green, and
+       a bad deploy never takes traffic.
+
+    2. Jobs orphaned by a previous process are failed. See
+       LeadStore.reclaim_stale_jobs -- persistence is what creates this
+       problem, so persistence is what has to clean up after it.
+    """
+    await store.initialize()
+
+    if settings.reclaim_stale_jobs:
+        reclaimed = await store.reclaim_stale_jobs()
+        if reclaimed:
+            log.warning(
+                "marked %d job(s) as failed: they were still running when a "
+                "previous process exited", reclaimed,
+            )
+
+    await _sweep_images()
+
+    yield
+
+
+async def _sweep_images() -> None:
+    """
+    Enforce image retention, then delete every file nothing points at.
+
+    THE ORDER OF THESE THREE STEPS IS THE WHOLE CORRECTNESS ARGUMENT.
+
+      1. expire  -- clear image_sha256 on leads past the retention window.
+      2. read    -- collect the digests still referenced, AFTER step 1, so the
+                    keep-list already reflects the expiries.
+      3. sweep   -- delete files not in that list.
+
+    Reading the keep-list before expiring would keep files that should have
+    gone (harmless, caught next boot). Sweeping before reading would delete
+    files that are still referenced (unrecoverable). Because deduplication
+    means one file can back many leads, a single wrong deletion can blank the
+    image for dozens of unrelated, unexpired rows -- so the sequence is
+    ordered to make the recoverable mistake the only possible one.
+
+    WHY A STARTUP SWEEP AND NOT A CRON. Retention here is a disk-space
+    guarantee, not a compliance deadline -- 30 days plus however long this
+    process happens to stay up is an acceptable window for a bounded,
+    measured-at-under-4GB dataset. A scheduler would add a background task to
+    supervise, a lock so two replicas do not sweep at once, and a failure mode
+    where a silently-dead timer lets the disk fill. A pass at boot is a few
+    milliseconds, needs none of that, and runs on exactly the event that
+    matters -- the redeploy.
+    """
+    if settings.image_retention_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=settings.image_retention_days
+        )
+        expired = await store.expire_images(cutoff.isoformat())
+        if expired:
+            log.info(
+                "image retention: cleared %d lead(s) older than %d days",
+                expired, settings.image_retention_days,
+            )
+
+    # Runs even when retention is disabled (0 = keep forever): orphans are
+    # produced by ordinary failures too -- a crash between writing the file
+    # and committing the row -- not only by expiry.
+    deleted, reclaimed = images.sweep(await store.referenced_image_hashes())
+    if deleted:
+        log.info(
+            "image sweep: deleted %d unreferenced file(s), reclaimed %.1f MB",
+            deleted, reclaimed / (1024 * 1024),
+        )
+
+
 app = FastAPI(
     title="Business Card Lead Extractor",
     description="Extracts structured leads from business card images using a "
                 "self-hosted vision-language model.",
-    version="0.3.0",
+    version="0.4.0",
+    lifespan=lifespan,
 )
 
 
@@ -54,7 +166,21 @@ async def no_store_api(request, call_next):
     bundle makes a fix look like it did not work.
     """
     response = await call_next(request)
-    if request.url.path.startswith("/api/") or request.url.path == "/health":
+
+    # A handler that set its own Cache-Control wins. Exactly one does -- the
+    # card image -- and it must, because blanket no-store would defeat the
+    # whole point of a content-addressed URL.
+    #
+    # THIS IS THE SUBTLE PART: a middleware that unconditionally overwrites a
+    # header is invisible at the call site. The route below would look
+    # completely correct, set `immutable`, and still ship `no-store` to the
+    # browser, with nothing in the route's own file to explain why. Deferring
+    # to the handler keeps the rule "no-store unless a route deliberately says
+    # otherwise", which is the behaviour the docstring above already claims.
+    handler_set_caching = "cache-control" in response.headers
+    if (
+        request.url.path.startswith("/api/") or request.url.path == "/health"
+    ) and not handler_set_caching:
         response.headers["Cache-Control"] = "no-store, must-revalidate"
         # An ETag would let the browser revalidate and reuse the body; for
         # state that changes every second that is exactly what we do not want.
@@ -248,7 +374,11 @@ async def extract_single(
             detail=f"file exceeds the "
                    f"{settings.max_upload_bytes // (1024 * 1024)} MB limit",
         )
-    lead = await extract_lead(file.filename or "upload", raw_bytes)
+    # retain_image=False: this route persists no lead row, so a retained image
+    # would be referenced by nothing and would sit on disk until swept.
+    lead = await extract_lead(
+        file.filename or "upload", raw_bytes, retain_image=False
+    )
     return lead.to_dict()
 
 
@@ -335,6 +465,65 @@ async def get_job(
     if job is None or not job.owned_by(user.id):
         raise HTTPException(status_code=404, detail=f"unknown job: {job_id}")
     return job.summary() if summary else job.to_dict()
+
+
+@app.get("/api/leads/{lead_id}/image")
+async def lead_image(
+    lead_id: str,
+    user: User = Depends(require_user),
+) -> Response:
+    """
+    Serve the normalised card image for one lead.
+
+    OWNERSHIP IS PART OF THE LOOKUP, NOT A CHECK AFTER IT. store.get_lead()
+    takes the user id and resolves it in the same query, so there is no way to
+    write this route such that it fetches first and authorises second. The
+    other routes check `job.owned_by(user.id)` after fetching, which is correct
+    but relies on the author remembering; this one cannot be written wrongly.
+
+    404 FOR ALL FOUR FAILURES -- unknown id, someone else's lead, never
+    retained, and expired. Distinguishing them would leak exactly what the
+    random ids exist to hide: "403" on a valid id confirms the id is valid.
+    The client has one thing to do in every case (show no image), so one
+    status is also the honest answer, not merely the cautious one.
+    """
+    lead = await store.get_lead(lead_id, user.id)
+    if lead is None or not lead.image_sha256:
+        raise HTTPException(status_code=404, detail="no image for this lead")
+
+    data = images.read(lead.image_sha256)
+    if data is None:
+        # The row points at a digest whose file is gone: retention swept it,
+        # or the volume was replaced. Not an error -- an expected end state.
+        raise HTTPException(status_code=404, detail="no image for this lead")
+
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={
+            # PRIVATE, NOT PUBLIC, AND THE DIFFERENCE IS A DATA BREACH.
+            # "public" permits any shared cache on the path -- a corporate
+            # proxy, a CDN -- to store the response and serve it to a
+            # DIFFERENT user who requests the same URL. These are photographs
+            # of named people's contact details, scoped to one account.
+            # "private" restricts caching to the requesting browser.
+            #
+            # immutable + a year is safe here only because the URL is
+            # content-addressed: the bytes behind a digest cannot change, so
+            # there is no stale version to worry about. On a mutable URL this
+            # header would be a bug that takes a year to expire.
+            "Cache-Control": "private, max-age=31536000, immutable",
+            # Display in place rather than prompting a download. The filename
+            # is ours, never the client's -- source_filename is
+            # attacker-controlled and has no business in a response header.
+            "Content-Disposition": f'inline; filename="{lead.image_sha256[:12]}.jpg"',
+            # The bytes are a JPEG we re-encoded ourselves, but this response
+            # is reached by user-supplied id, so pin the type: it stops a
+            # browser from content-sniffing its way to treating the body as
+            # anything other than an image.
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/api/jobs")

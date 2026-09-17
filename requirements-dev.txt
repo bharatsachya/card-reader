@@ -1,0 +1,19 @@
+# Development and CI only. Deliberately a SEPARATE file from requirements.txt
+# so the Dockerfile installs only what production needs: a test runner and a
+# linter inside a running container are dead weight and extra attack surface,
+# and they pull in transitive packages nobody audited for production use.
+#
+# Install both for local work:
+#   ./.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+# --- Test runner ---
+pytest==9.1.1
+# LeadStore's interface is async, so its tests are coroutines. Without this
+# plugin pytest silently SKIPS async test functions with a warning rather than
+# failing -- which looks exactly like a passing suite.
+pytest-asyncio==1.4.0
+
+# --- Lint + format. Replaces flake8/isort/black with one fast binary. ---
+ruff==0.16.8

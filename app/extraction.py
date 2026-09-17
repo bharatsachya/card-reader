@@ -15,15 +15,19 @@ The three statuses map to genuinely different causes:
 """
 
 import asyncio
+import logging
 
 import httpx
 
+from app import images
 from app.config import settings
-from app.imaging import ImageProcessingError, preprocess_to_data_url
+from app.imaging import ImageProcessingError, preprocess_to_jpeg, to_data_url
 from app.model_client import ModelError, complete
 from app.parsing import parse_lead_json
 from app.postprocess import postprocess_fields
 from app.schema import Lead
+
+log = logging.getLogger("card-reader")
 
 
 async def _complete_with_retry(
@@ -65,11 +69,18 @@ async def extract_lead(
     filename: str,
     raw_bytes: bytes,
     client: httpx.AsyncClient | None = None,
+    retain_image: bool = True,
 ) -> Lead:
     """
     Run the full pipeline for a single image. Never raises.
 
     `client` is passed through so a bulk upload can share one connection pool.
+
+    `retain_image` keeps the normalised JPEG on disk and records its digest on
+    the Lead. /api/extract passes False: it persists no lead row, so a retained
+    image there would be referenced by nothing and would simply wait to be
+    swept. Storing bytes that nothing can ever point at is not caching, it is
+    a leak with a cleanup job attached.
     """
     # --- 0. Reject obviously-unusable input ---------------------------------
     # A zero-byte file is the classic result of a failed drag-and-drop or an
@@ -84,7 +95,7 @@ async def extract_lead(
 
     # --- 1. Preprocess (deterministic) --------------------------------------
     try:
-        data_url = preprocess_to_data_url(raw_bytes)
+        jpeg_bytes = preprocess_to_jpeg(raw_bytes)
     except ImageProcessingError as exc:
         # A non-image upload (PDF, .docx, corrupt file) is a user error, not a
         # server error, and NOT a model error -- the model was never called.
@@ -96,11 +107,41 @@ async def extract_lead(
             error=f"could not read image: {exc}",
         )
 
+    # --- 1b. Retain the normalised image ------------------------------------
+    #
+    # WHY THIS FAILURE IS SWALLOWED. A full disk, a read-only volume or a bad
+    # IMAGE_DIR must not cost the user their extraction: the lead is what they
+    # came for and the image is a convenience. So retention failing degrades to
+    # "this lead has no image" -- a state the UI already has to handle, because
+    # retention deletes images on purpose -- rather than turning a readable
+    # card into a flagged row.
+    #
+    # It is logged at WARNING and not silently, because "no images are being
+    # saved" is invisible from the outside until someone clicks a thumbnail
+    # weeks later and finds nothing there.
+    image_sha256: str | None = None
+    if retain_image:
+        try:
+            image_sha256 = images.put(jpeg_bytes)
+        except OSError as exc:
+            log.warning("could not retain image for %s: %s", filename, exc)
+
+    # The digest is attached to EVERY outcome below, not just the successful
+    # one -- and the failures are where it matters most. A card that came back
+    # unreadable is precisely the one someone needs to look at to decide
+    # whether to re-shoot it or to blame the model.
+    data_url = to_data_url(jpeg_bytes)
+
     # --- 2. Call the model (NON-deterministic) ------------------------------
     try:
         raw_reply = await _complete_with_retry(data_url, client=client)
     except ModelError as exc:
-        return Lead(source_filename=filename, status="model_error", error=str(exc))
+        return Lead(
+            source_filename=filename,
+            status="model_error",
+            error=str(exc),
+            image_sha256=image_sha256,
+        )
 
     # --- 3. Parse (defensive) -----------------------------------------------
     fields, parse_error = parse_lead_json(raw_reply)
@@ -112,13 +153,16 @@ async def extract_lead(
             status="parse_error",
             error=parse_error,
             raw_output=raw_reply[:1000],   # truncated; kept for debugging
+            image_sha256=image_sha256,
         )
 
     # --- 4. Post-process (deterministic) ------------------------------------
     cleaned = postprocess_fields(fields)
 
     # --- 5. Build the Lead ---------------------------------------------------
-    lead = Lead(source_filename=filename, status="ok", **cleaned)
+    lead = Lead(
+        source_filename=filename, status="ok", image_sha256=image_sha256, **cleaned
+    )
     if lead.is_empty:
         # Valid JSON, but every field null: an unreadable or non-card image.
         # Technically a success, but useless to the user, so flag it.

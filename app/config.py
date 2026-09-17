@@ -48,6 +48,17 @@ def _env_str(name: str, default: str) -> str:
     return value if value else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """
+    Read a boolean env var. Everything is a string in an environment, and
+    `bool("false")` is True, which is a genuinely common production bug.
+    """
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_int(name: str, default: int) -> int:
     """Read an int env var, ignoring values that aren't valid integers."""
     raw = os.getenv(name)
@@ -150,6 +161,65 @@ class Settings:
         # Empty string = use the system temp dir.
         self.upload_dir: str = _env_str("UPLOAD_DIR", "")
 
+        # --- Storage --------------------------------------------------------
+        # Which LeadStore implementation build_store() returns.
+        #
+        #   sqlite  - persists to DB_PATH. Survives restarts, and is the only
+        #             value under which `uvicorn --workers N` is correct.
+        #   memory  - the original dict. Loses everything on restart. Kept
+        #             because it makes tests hermetic (no file, no cleanup)
+        #             and because it is a one-variable escape hatch if the
+        #             database is ever the thing that is broken.
+        #
+        # Defaults to sqlite: an app that silently forgets a 25-minute batch
+        # on restart is the wrong default, and "memory" should be something
+        # you opt into deliberately.
+        self.store_backend: str = _env_str("STORE_BACKEND", "sqlite").lower()
+
+        # Where the SQLite file lives. A relative path is resolved against the
+        # process's working directory, which in the container is /app -- so
+        # the default lands inside the mounted volume at /app/data and
+        # survives redeploys. Point it somewhere absolute on a host where the
+        # working directory is not guaranteed (systemd, App Service).
+        self.db_path: str = _env_str("DB_PATH", "./data/leads.db")
+
+        # On startup, mark jobs still saying "queued"/"running" as failed.
+        #
+        # Persistence introduces a failure mode memory never had: the worker
+        # is an asyncio task inside one process, so when that process dies the
+        # task dies -- but the row survives, permanently claiming to be
+        # running, and the UI polls a progress bar that can never complete.
+        #
+        # MUST BE FALSE FOR MORE THAN ONE REPLICA. With several processes
+        # against one database, a replica starting later -- a rolling deploy,
+        # an autoscale event -- would see another replica's genuinely live job
+        # and kill it. True is correct for exactly one replica, which is what
+        # this app should run as while a job is a local asyncio task.
+        self.reclaim_stale_jobs: bool = _env_bool("RECLAIM_STALE_JOBS", True)
+
+        # --- Image retention -------------------------------------------------
+        # Where the normalised card images live. Content-addressed, so the
+        # filename IS the sha256 of the bytes and identical uploads collapse
+        # to one file. Sits beside the database so a single mounted volume
+        # covers all persistent state.
+        self.image_dir: str = _env_str("IMAGE_DIR", "./data/images")
+
+        # How long a card image is kept before the startup sweep deletes it.
+        # The extracted LEAD is kept forever -- it is a few hundred bytes and
+        # it is the thing of value. Only the image expires.
+        #
+        # MEASURED COST ON THIS HARDWARE: a normalised card is 50-260 KB
+        # (~150 KB typical). At 170 s/card with max_concurrency=1 the box
+        # cannot physically exceed ~508 cards/day, so 30 days is bounded at
+        # roughly 2.3 GB, worst case 3.9 GB.
+        #
+        # *** REVISIT THIS THE DAY MODEL_URL POINTS AT A GPU. *** That ceiling
+        # is a function of how slow inference is. At 2 s/card the same 30-day
+        # window allows ~85x the throughput, and this setting quietly becomes
+        # a ~330 GB disk commitment. The two variables are coupled, and this
+        # comment is the only thing that links them.
+        self.image_retention_days: int = _env_int("IMAGE_RETENTION_DAYS", 30)
+
     @property
     def auth_enabled(self) -> bool:
         """Auth is on only when BOTH halves are configured."""
@@ -179,6 +249,11 @@ class Settings:
             "max_concurrency": self.max_concurrency,
             "model_max_attempts": self.model_max_attempts,
             "auth_enabled": self.auth_enabled,
+            # Reported because "where did my jobs go after the restart?" is
+            # answered instantly by seeing store_backend=memory here.
+            "store_backend": self.store_backend,
+            "image_retention_days": self.image_retention_days,
+            "db_path": self.db_path if self.store_backend == "sqlite" else None,
         }
 
 

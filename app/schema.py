@@ -43,7 +43,26 @@ class Lead:
     email: Optional[str] = None
 
     # --- Provenance / diagnostics (not model output) ---
+
+    # Assigned by the store when the lead is recorded, not by the pipeline --
+    # it identifies a stored row, and until it is stored there is nothing to
+    # identify. None for a lead from /api/extract, which persists nothing.
+    #
+    # RANDOM, NOT SEQUENTIAL. This id appears in a URL that serves a
+    # photograph of a named person's business card. An incrementing integer
+    # would let anyone walk 1, 2, 3 and enumerate every card image on the
+    # server; the ownership check would stop them, but a single missed check
+    # would then expose everything rather than one row. The API already
+    # returns 404 instead of 403 for another user's job so that ids cannot be
+    # probed -- sequential lead ids would hand that back for free.
+    id: Optional[str] = None
+
     source_filename: str = ""
+
+    # sha256 of the NORMALISED JPEG, which is also its filename on disk.
+    # None means no image was retained, or it has since expired -- both are
+    # ordinary states the UI must handle rather than errors.
+    image_sha256: Optional[str] = None
     # "ok"          -> model returned parseable JSON
     # "empty"       -> valid JSON, but every field was null
     # "parse_error" -> model replied, but we could not get JSON out of it

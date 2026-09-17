@@ -78,6 +78,12 @@ class ImageProcessingError(Exception):
     """Raised when the uploaded bytes are not a usable image."""
 
 
+def to_data_url(jpeg_bytes: bytes) -> str:
+    """Wrap already-normalised JPEG bytes as a data URL for the model."""
+    encoded = base64.b64encode(jpeg_bytes).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
 def preprocess_to_data_url(raw_bytes: bytes) -> str:
     """
     Turn arbitrary uploaded image bytes into a normalised JPEG data URL.
@@ -86,6 +92,29 @@ def preprocess_to_data_url(raw_bytes: bytes) -> str:
     format the OpenAI-compatible image_url content block expects. Ollama,
     llama.cpp and vLLM all accept this, which is why we use it rather than any
     server-specific image field.
+
+    Kept as a one-liner over preprocess_to_jpeg so that existing callers --
+    and /api/model-check, which has no image to retain -- are unchanged.
+    """
+    return to_data_url(preprocess_to_jpeg(raw_bytes))
+
+
+def preprocess_to_jpeg(raw_bytes: bytes) -> bytes:
+    """
+    Normalise uploaded image bytes to JPEG. THE function; everything else wraps it.
+
+    WHY THIS WAS SPLIT OUT OF preprocess_to_data_url. Image retention needs the
+    raw JPEG bytes: to hash them for the content-addressed filename, and to
+    write them to disk. Going through the data URL would mean base64-encoding
+    (+33% size) and then immediately decoding again, per card, to recover bytes
+    this function already had. The split costs one extra function and makes the
+    encode happen exactly once, at the point that actually needs it.
+
+    It also fixes what gets STORED. The bytes retained on disk are now
+    guaranteed to be byte-identical to the bytes the model saw -- same
+    rotation, same resize, same quantisation tables. When a user disputes an
+    extraction, the image they are shown is the evidence, not a re-derivation
+    of it that might differ.
     """
     try:
         image = Image.open(io.BytesIO(raw_bytes))
@@ -130,8 +159,7 @@ def preprocess_to_data_url(raw_bytes: bytes) -> str:
     # halves colour resolution, which smears coloured text on coloured
     # backgrounds -- common on business cards.
     image.save(buffer, format="JPEG", quality=90, subsampling=0, optimize=True)
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{encoded}"
+    return buffer.getvalue()
 
 
 def describe(raw_bytes: bytes) -> dict:
