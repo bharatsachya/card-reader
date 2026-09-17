@@ -16,3 +16,24 @@ samples/batch/
 
 # macOS
 .DS_Store
+
+# Private keys. ohive.pem sits untracked in this directory: without this rule a
+# single `git add -A` commits an SSH private key into history permanently, and
+# rewriting history is the only way back out. Ignore the whole class, not the
+# one filename.
+*.pem
+*.key
+id_rsa*
+
+# Runtime state: the SQLite database and retained card images. Generated, often
+# large, and contains extracted personal data (names, phones, emails) that must
+# never reach a public repository.
+data/
+
+# Real card photographs used for local testing. buisness.jpeg is a photograph
+# of an actual person's business card -- their name, employer, phone and email.
+# That is personal data under GDPR and the DPDP Act, and a git repository is
+# permanent and, here, pushed to GitHub. Synthetic cards for testing come from
+# `python tools/make_test_card.py`; real ones stay on the machine that took them.
+# Delete this rule and `git add -f buisness.jpeg` if you deliberately want it in.
+buisness.jpeg

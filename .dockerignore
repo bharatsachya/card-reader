@@ -1,0 +1,45 @@
+# What NOT to send to the Docker daemon as build context.
+#
+# Two separate reasons, and the second is the important one:
+#   1. Speed — the whole context is tarred and uploaded to the daemon before
+#      the first instruction runs. .venv/ alone is ~200 MB of Linux-useless
+#      macOS binaries.
+#   2. SAFETY — anything in the context can be baked into a layer by a careless
+#      COPY, and layers are forever: deleting a file in a later RUN does not
+#      remove it from the image, it is still there in the layer beneath and
+#      `docker history` will show it. Secrets must never enter the context at
+#      all.
+
+# --- Secrets. Never in the context, never in a layer. -----------------------
+*.pem
+*.key
+id_rsa*
+.env
+.env.local
+
+# --- Runtime state. The database and retained card images belong in the
+# --- mounted volume, not baked into the image. Copying them in would ship one
+# --- user's extracted personal data to everyone who pulls the image.
+data/
+
+# --- Host-specific and useless in Linux ------------------------------------
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# --- Version control. .git/ is often larger than the app itself, and it
+# --- contains every version of every file ever committed.
+.git/
+.gitignore
+.github/
+
+# --- Docs and fixtures: not needed to run the server -------------------------
+README.md
+samples/
+Dockerfile
+.dockerignore
+docker-compose.yml
