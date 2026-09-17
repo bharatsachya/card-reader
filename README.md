@@ -500,9 +500,10 @@ the card occupies **67% of the frame on average**, so a third of every image is
 fabric or granite that costs exactly as much as a phone number.
 
 Because A2 showed token count is fixed, **cropping cannot make inference
-faster.** What it changes is *what those 1,341 tokens contain*: after cropping,
-the fixed token budget is spent on card instead of background, which raises the
-effective resolution of the text. The win moves from latency to accuracy.
+faster.** The hypothesis was that it would improve *accuracy* instead: with the
+token budget fixed, spending it on card rather than background should raise the
+effective resolution of the text. That hypothesis was testable, and it was
+tested.
 
 | | result |
 |---|---|
@@ -511,7 +512,51 @@ effective resolution of the text. The win moves from latency to accuracy.
 | pixels removed when detected | **33% on average**, best case 59% |
 | detection cost | 15–110 ms per image |
 
-<!--A3_ACCURACY-->
+**And then the accuracy measurement said no.**
+
+Six real business cards (supplied by the client, not synthetic), each run with
+cropping off and on, scored field-by-field against hand-written ground truth:
+
+| | no crop | with crop |
+|---|---|---|
+| fields correct | **35/42 (83%)** | **32/42 (76%)** |
+| median latency | 143 s | 145 s |
+| prompt tokens | 1,343 | 1,356 |
+
+**Cropping made extraction worse, not better.** Two cards regressed and none
+improved:
+
+| card | no crop | with crop | newly wrong |
+|---|---|---|---|
+| SEEMA (two people) | 7/7 | **5/7** | `title`, `location` |
+| S. K. Brokers (mononym) | 5/7 | **4/7** | `last_name` |
+| the other four | unchanged | unchanged | — |
+
+The likely mechanism, and it is a hypothesis rather than a finding: once the
+card fills the frame, the model appears more willing to *assign* a value to a
+field that is genuinely absent. On the SEEMA card, `title` is correctly `null`
+when the card sits on a granite worktop and becomes a guess once cropped —
+probably "REAL ESTATE & INVESTMENTS", which is a strapline, not a job title.
+Surrounding context seems to help the model decide a field is missing.
+
+This also refines the A2 result. Tokens are invariant to **scale** but not to
+**aspect ratio**: cropping changes the card's proportions and token count moves
+between 1,337 and 1,380. So the fixed grid has a fixed *area*, not fixed
+dimensions.
+
+**Cropping is therefore implemented and off by default.** The code is in
+`app/cardcrop.py`, it detects reliably and fails safe, and on a corpus where
+the card were smaller in frame it may well pay off — the six real cards here
+are all close-ups where the card already dominates. What is not defensible is
+enabling it on the strength of a plausible mechanism after the measurement said
+otherwise. n=6 is a small sample and the direction is consistent.
+
+**The dominant error is not cropping at all — it is `location`, wrong in 11 of
+12 runs in both configurations.** The model returns the full street address
+where the prompt asks for "the city, or the city and region". That is a
+prompt-adherence problem, it costs nothing at inference time to fix, and it is
+worth more than either A2 or A3: correcting it alone would move accuracy from
+83% to roughly 97% on this corpus.
 
 The module is built so every failure path returns the original image. A
 detector that occasionally returns a confident crop of the *wrong* rectangle is
