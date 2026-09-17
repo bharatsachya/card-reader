@@ -25,7 +25,7 @@
    control: anyone can bypass them with curl, which is exactly why the server
    enforces the same limits independently. */
 const MAX_FILE_BYTES = 15 * 1024 * 1024;
-const MAX_FILES = 50;
+const MAX_FILES = 20;   // mirrors MAX_FILES_PER_REQUEST; see app/config.py
 const POLL_INTERVAL_MS = 1000;
 /* Used once a job has gone several ticks with no card landing. See pollDelay(). */
 const SLOW_POLL_INTERVAL_MS = 5000;
@@ -170,7 +170,7 @@ function renderChips() {
   el('prompt-text').innerHTML = any
     ? 'Add more, or <strong>choose files</strong>'
     : 'Drop business cards here, or <strong>choose files</strong>';
-  if (!any) setHint('JPG, PNG, HEIC or WebP · up to 50 files, 15 MB each');
+  if (!any) setHint('JPG, PNG, HEIC or WebP · up to 20 files, 15 MB each');
 }
 
 /* ---------- drag and drop ------------------------------------------------ */

@@ -37,3 +37,10 @@ data/
 # `python tools/make_test_card.py`; real ones stay on the machine that took them.
 # Delete this rule and `git add -f buisness.jpeg` if you deliberately want it in.
 buisness.jpeg
+# Real card photos supplied for benchmarking. Same reasoning: these are
+# photographs of actual people's contact details. They live in samples/real/
+# (also ignored) and are referenced by the benchmark by path, never committed.
+cl*.jpg
+IMG_*.jpg
+WhatsApp Image*.jpeg
+samples/real/

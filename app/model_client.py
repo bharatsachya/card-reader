@@ -35,10 +35,12 @@ def _build_payload(image_data_url: str) -> dict:
         # "creativity" is pure downside -- it would make bugs unreproducible
         # and results inconsistent between runs of the same batch.
         "temperature": 0,
-        # Cap the reply length. A well-behaved answer is ~100 tokens; this
-        # bounds the damage if the model ignores the prompt and starts
-        # rambling, which would otherwise burn the full timeout.
-        "max_tokens": 512,
+        # Cap the reply length. MEASURED: a well-behaved answer is 83-86
+        # completion tokens, so 256 is triple the observed need and still
+        # bounds the damage when a confusing image makes the model ramble --
+        # generation is the expensive half on CPU, and tokens past the JSON
+        # are paid for and then discarded by the parser.
+        "max_tokens": 256,
         "stream": False,
     }
 

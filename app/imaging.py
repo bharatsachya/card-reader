@@ -20,8 +20,11 @@ happen here, and both materially change extraction accuracy:
    the text. Token count scales with PIXEL AREA, so cost is quadratic in edge
    length. A 4032x3024 phone photo is ~12x the area of a 1024x768 one, i.e.
    roughly 12x the vision tokens. Consequences:
-     - Latency: on a CPU-hosted 2B model this is the difference between
-       "a few seconds" and "minutes per card".
+     - Latency: MEASURED on Qwen2.5-VL-3B via Ollama, resizing between 256px
+       and 1024px changed prompt_tokens NOT AT ALL (1341 every time) -- the
+       model normalises internally. See the Performance section of the
+       README; the reasoning below is why an edge cap is still correct, but
+       on THIS runtime it does not buy the token saving it implies.
      - Memory: vision tokens occupy the KV cache; a big enough image can
        exceed the context window and the request simply fails.
      - Accuracy does NOT improve to match. Most VLMs (Qwen2.5-VL/Qwen3-VL

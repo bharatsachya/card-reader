@@ -3,8 +3,8 @@ The background worker that processes a bulk upload.
 
 WHY A JOB QUEUE AT ALL (the core scaling decision):
 
-A CPU-hosted quantized 2B VLM takes roughly 10-30 seconds per card. So a
-50-card batch is ~15-25 minutes of work. You cannot hold an HTTP request open
+A CPU-hosted Qwen2.5-VL-3B takes 136-172 seconds per card -- MEASURED on the
+target box, not estimated. So a 20-card batch is roughly 50 minutes of work. You cannot hold an HTTP request open
 for that:
   * browsers abandon fetches,
   * nginx's default proxy_read_timeout is 60s,

@@ -1,79 +1,73 @@
-# Card Reader — app + model on one box.
+# Card Reader — colocated with Ollama on one EC2 box.
 #
-#   docker compose up -d                  app + ollama
-#   docker compose --profile app-only up -d   app alone, MODEL_URL points elsewhere
+#   docker compose up -d --build
 #
-# There is no `version:` key. Compose v2 ignores it and warns, and it has meant
-# nothing since the v1 file-format was retired.
+# Ollama is NOT a service here. It runs as a host systemd unit, already
+# installed, bound to 127.0.0.1:11434. That is deliberate and is the whole
+# reason for network_mode: host below.
 
 services:
   app:
     build: .
-    # Restart on crash and on boot, but NOT after an explicit `docker compose
-    # stop` -- that was a human decision and the machine should not overrule it.
     restart: unless-stopped
-    ports:
-      - "${APP_PORT:-8000}:8000"
+
+    # HOST NETWORKING, AND THIS IS THE ONE DECISION TO UNDERSTAND HERE.
+    #
+    # Ollama listens on 127.0.0.1:11434 only. A container on the default bridge
+    # network has its OWN loopback, so `127.0.0.1` inside the container means
+    # the container itself, not the host -- the request would connect to
+    # nothing. The usual workaround, extra_hosts: host.docker.internal:
+    # host-gateway, does not help either: traffic then arrives at the host from
+    # the docker bridge subnet (172.17.x.x), and Ollama bound to 127.0.0.1
+    # refuses it.
+    #
+    # The two ways out are to rebind Ollama to 0.0.0.0 -- which puts an
+    # unauthenticated inference endpoint on the box's network interface, the
+    # exact thing colocating was meant to avoid -- or to share the host's
+    # network namespace. This does the second. The container's 127.0.0.1 IS the
+    # host's, Ollama stays bound to loopback and is unreachable from the
+    # internet, and no card image ever leaves the machine.
+    #
+    # The cost is that port mapping no longer applies: the app binds the host's
+    # :8000 directly. nginx in front then owns :80. That is acceptable on a
+    # single-purpose box and is why there is no `ports:` key.
+    network_mode: host
+
     env_file:
       - .env
     environment:
-      # Set here rather than in .env because it is a property of the COMPOSE
-      # TOPOLOGY, not of the deployment: "ollama" is the service name above,
-      # resolved by Docker's internal DNS on the shared network. Putting it in
-      # .env would mean a file that only works inside compose.
-      MODEL_URL: ${MODEL_URL:-http://ollama:11434/v1/chat/completions}
-      # Absolute paths inside the volume mount. The image's WORKDIR is /app so
-      # the relative defaults would land in the same place, but being explicit
-      # means a future WORKDIR change cannot silently move the database.
+      MODEL_URL: http://127.0.0.1:11434/v1/chat/completions
+      MODEL_NAME: qwen2.5vl:3b
       DB_PATH: /app/data/leads.db
       IMAGE_DIR: /app/data/images
       STORE_BACKEND: sqlite
+      # Bound above the slowest measured card with real headroom. A timeout
+      # mid-card discards every second already spent on it, so erring long is
+      # much cheaper than erring short.
+      MODEL_TIMEOUT_SECONDS: "600"
+      # A review window, not a product. 7 days of images at the measured
+      # ceiling (~500 cards/day absolute max) is well under 1 GB.
+      IMAGE_RETENTION_DAYS: "7"
+      # Single replica, so this is safe and is what stops a job killed by a
+      # restart from polling forever.
+      RECLAIM_STALE_JOBS: "true"
+      # Clerk stays wired and documented but OFF -- a reviewer told the URL is
+      # public must not meet a signup wall. See the README.
+      AUTH_MODE: local
+      PORT: "8000"
+
     volumes:
-      # NAMED, not a bind mount. A bind mount inherits the host directory's
-      # uid, which will not be the container's uid 10001, and the app then
-      # cannot write -- surfacing as "unable to open database file". A named
-      # volume is initialised from the image, where /app/data is already
-      # owned by app.
+      # Named, not a bind mount: a bind mount inherits the host directory's
+      # uid, which is not the container's 10001, and the app then cannot write
+      # -- surfacing as "unable to open database file".
       - card-data:/app/data
-    depends_on:
-      ollama:
-        condition: service_started
-        required: false     # so --profile app-only works with no ollama present
+
     healthcheck:
-      # Repeated here as well as in the Dockerfile so `docker compose ps` shows
-      # health even for an image built elsewhere.
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
-
-  ollama:
-    image: ollama/ollama:latest
-    restart: unless-stopped
-    # NOT published to the host by default. The app reaches it over the compose
-    # network; exposing 11434 publicly would put an unauthenticated model
-    # endpoint on the internet for anyone to run inference on at your expense.
-    # Uncomment only for debugging from the host.
-    # ports:
-    #   - "127.0.0.1:11434:11434"
-    volumes:
-      # Model weights are gigabytes and are re-downloaded on every cold start
-      # without this. Separate from card-data so backing up your leads does not
-      # mean backing up a 3 GB model you can re-pull in a command.
-      - ollama-models:/root/.ollama
-    # After the first `up`, pull the model once:
-    #   docker compose exec ollama ollama pull qwen2.5vl:3b
-    #
-    # MEMORY. Qwen2.5-VL-3B needs roughly 4 GB resident. On a 2 vCPU / 8 GB
-    # box that leaves enough for the app, but not much -- and the OOM killer
-    # takes whichever process is largest, which is ollama, mid-extraction. The
-    # limit makes that failure explicit and attributable rather than random.
-    deploy:
-      resources:
-        limits:
-          memory: 6g
+      start_period: 15s
 
 volumes:
   card-data:
-  ollama-models:

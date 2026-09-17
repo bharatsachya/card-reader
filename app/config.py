@@ -4,7 +4,7 @@ Central configuration, read from environment variables.
 Why this file exists at all:
 Nothing about *which* model we talk to should be baked into application logic.
 Today this points at a local stub / Ollama; tomorrow it points at llama.cpp on
-an AWS box serving a quantized Qwen3-VL-2B. That switch must be an env-var
+an EC2 box serving Qwen2.5-VL-3B via Ollama. That switch must be an env-var
 change, not a code change. Every model-related knob lives here and here only.
 """
 
@@ -86,8 +86,11 @@ class Settings:
         # Some servers (vLLM, OpenAI) require an Authorization header; Ollama
         # and llama.cpp ignore it. Optional, so remote deploys need no code edit.
         self.model_api_key: str = _env_str("MODEL_API_KEY", "")
-        # A CPU-hosted 2B model is slow. Generous default, tunable per deploy.
-        self.model_timeout_seconds: int = _env_int("MODEL_TIMEOUT_SECONDS", 180)
+        # A CPU-hosted 3B VLM is slow: MEASURED at 136-172s per card on the
+        # target box (m7i-flex.large, 2 vCPU, no GPU). 180s left almost no
+        # headroom above the worst measured card, and a timeout mid-card
+        # throws away every second already spent on it.
+        self.model_timeout_seconds: int = _env_int("MODEL_TIMEOUT_SECONDS", 600)
         # How many times to try one card before giving up. Covers transient
         # blips (a model still loading, a reset socket) without turning a
         # genuinely-dead backend into an hours-long batch.
@@ -166,9 +169,29 @@ class Settings:
         # being received in full and then rejected.
         self.max_upload_bytes: int = _env_int("MAX_UPLOAD_BYTES", 15 * 1024 * 1024)
 
-        # Most files in one request. Caps the worst-case disk spool for a
-        # single request at max_files * max_upload_bytes (here ~750 MB).
-        self.max_files_per_request: int = _env_int("MAX_FILES_PER_REQUEST", 50)
+        # Most files in one request.
+        #
+        # LOWERED FROM 50 TO 20, AND THE REASON IS THE MEASURED CARD TIME.
+        # At 136-172s per card with max_concurrency=1, the arithmetic is:
+        #
+        #     50 cards  ->  113 to 143 minutes   (up to 2h23m)
+        #     20 cards  ->   45 to  57 minutes
+        #     10 cards  ->   23 to  29 minutes
+        #
+        # 50 was chosen when a card was assumed to take 10-30s, which made a
+        # batch ~15 minutes. Against the real number it commits a user to over
+        # two hours in a single request, and three things get worse together
+        # across that window: the browser tab must stay open to see progress,
+        # a process restart loses whatever has not finished, and the estimate
+        # shown at minute five is extrapolated from one card.
+        #
+        # 20 keeps the worst case under an hour -- a "leave it running over
+        # lunch" window rather than an afternoon -- and bounds the disk spool
+        # to 20 x 15 MB = 300 MB. It is not a technical limit: someone with 60
+        # cards sends three batches, each of which can fail independently
+        # instead of all sixty failing together. Raise it via the env var if a
+        # faster backend makes the arithmetic different.
+        self.max_files_per_request: int = _env_int("MAX_FILES_PER_REQUEST", 20)
 
         # How many cards may be in the model/decode pipeline simultaneously.
         # THIS is the setting that bounds peak memory: image decode costs

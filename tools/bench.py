@@ -203,21 +203,51 @@ def _comparable(field: str, value) -> str:
     return text
 
 
+def _matches(field: str, got_raw, want_raw) -> bool:
+    """
+    Is the model's value acceptable for this field?
+
+    A ground-truth value may be:
+      * None  -- the field genuinely is not printed on the card, so the only
+                 correct answer is null. Inventing one is a failure, and this
+                 is the check that catches hallucination.
+      * a str -- one correct answer.
+      * a list -- ANY of these is correct.
+
+    THE LIST FORM IS NOT LENIENCY, IT IS HONESTY. Three of the six real cards
+    print two or more people. When a card says both "Gajendra Nagda" and
+    "Rajendra Puri", scoring whichever one I typed first as correct and the
+    other as wrong measures my transcription order, not the model. The same
+    applies to a card printing six phone numbers, or a company that is both
+    "Shree Basav Traders" and "Ashok Agency".
+    """
+    got = _comparable(field, got_raw)
+
+    if want_raw is None:
+        # Nothing on the card: the model must return nothing.
+        return got == ""
+
+    options = want_raw if isinstance(want_raw, list) else [want_raw]
+    for option in options:
+        want = _comparable(field, option)
+        if field == "phone" and got and want:
+            # Compare the last 9 digits: the printed number may omit a country
+            # code the model adds, or carry a leading 0 that E164 drops.
+            if got.endswith(want[-9:]) or want.endswith(got[-9:]):
+                return True
+        elif got == want:
+            return True
+    return False
+
+
 def score(fields: dict | None, truth: dict) -> tuple[int, list[str]]:
     """Fields correct out of seven, plus the names of the ones that are wrong."""
     if fields is None:
         return 0, list(LEAD_FIELDS)
-    wrong = []
-    for field in LEAD_FIELDS:
-        got = _comparable(field, fields.get(field))
-        want = _comparable(field, truth.get(field))
-        if field == "phone" and got and want:
-            # The printed number may omit the country code the model adds.
-            ok = got.endswith(want[-9:]) or want.endswith(got[-9:])
-        else:
-            ok = got == want
-        if not ok:
-            wrong.append(field)
+    wrong = [
+        field for field in LEAD_FIELDS
+        if not _matches(field, fields.get(field), truth.get(field))
+    ]
     return len(LEAD_FIELDS) - len(wrong), wrong
 
 
@@ -227,7 +257,11 @@ def score(fields: dict | None, truth: dict) -> tuple[int, list[str]]:
 
 def load_cards(directory: pathlib.Path) -> list[dict]:
     cards, digests = [], {}
-    for image_path in sorted(directory.glob("*.jpg")):
+    images = sorted(
+        [p for p in directory.iterdir()
+         if p.suffix.lower() in {".jpg", ".jpeg", ".png"}]
+    )
+    for image_path in images:
         truth_path = image_path.with_suffix(".json")
         if not truth_path.exists():
             print(f"  skipping {image_path.name}: no ground truth alongside it")

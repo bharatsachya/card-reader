@@ -13,11 +13,26 @@
 [Unit]
 Description=Card Reader — business card lead extractor
 Documentation=https://github.com/bharatsachya/card-reader
-# Wants, not Requires: if ollama is on this box we prefer it started first,
-# but the app must still come up when the model is remote or temporarily down.
-# The app reports an unreachable model on /health rather than refusing to run.
-After=network-online.target
-Wants=network-online.target
+# ORDERED AFTER OLLAMA, AND THAT IS WEAKER THAN IT LOOKS.
+#
+# After= orders STARTUP, not readiness. systemd considers ollama.service
+# "started" as soon as the process is up and listening -- which is seconds --
+# but Ollama does not load the 3.2 GB model until the first request arrives,
+# and that load takes tens of seconds on this box. So after a reboot the app
+# will be serving before the model can answer.
+#
+# The practical consequence: THE FIRST UPLOAD AFTER A REBOOT MAY FAIL, or take
+# far longer than a normal card, while the weights are read in. The app handles
+# it correctly rather than crashing -- the request is retried
+# (MODEL_MAX_ATTEMPTS) and, if it still fails, becomes a flagged model_error
+# row naming the reason. But it is a real rough edge and it is documented in
+# the README rather than hidden.
+#
+# Wants= rather than Requires= so that a failed or absent ollama does not stop
+# the app booting: it still serves the UI and reports the model as unreachable
+# on /health, which is far more useful than refusing to start.
+After=network-online.target ollama.service
+Wants=network-online.target ollama.service
 
 [Service]
 Type=exec
@@ -30,6 +45,14 @@ WorkingDirectory=/opt/card-reader
 Environment="DB_PATH=/var/lib/card-reader/leads.db"
 Environment="IMAGE_DIR=/var/lib/card-reader/images"
 Environment="STORE_BACKEND=sqlite"
+# Ollama is on this same box, on loopback, and stays there.
+Environment="MODEL_URL=http://127.0.0.1:11434/v1/chat/completions"
+Environment="MODEL_NAME=qwen2.5vl:3b"
+# Above the slowest measured card (172s) with real headroom.
+Environment="MODEL_TIMEOUT_SECONDS=600"
+Environment="IMAGE_RETENTION_DAYS=7"
+Environment="RECLAIM_STALE_JOBS=true"
+Environment="AUTH_MODE=local"
 EnvironmentFile=-/etc/card-reader.env
 
 # One worker. Job state is an asyncio task inside ONE process, so a second
@@ -61,6 +84,11 @@ LockPersonality=true
 # The app makes outbound HTTP to the model and to Clerk's JWKS, and listens on
 # TCP. It has no use for anything else.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The app talks to Ollama on loopback and to nginx on loopback. With Clerk
+# enabled it also needs outbound HTTPS for the JWKS; leave this commented
+# unless you turn AUTH_MODE=clerk on.
+# IPAddressAllow=localhost
+# IPAddressDeny=any
 
 [Install]
 WantedBy=multi-user.target
