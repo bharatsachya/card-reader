@@ -27,6 +27,8 @@
 const MAX_FILE_BYTES = 15 * 1024 * 1024;
 const MAX_FILES = 50;
 const POLL_INTERVAL_MS = 1000;
+/* Used once a job has gone several ticks with no card landing. See pollDelay(). */
+const SLOW_POLL_INTERVAL_MS = 5000;
 const MAX_THUMBS = 8;
 
 const COLUMNS = ['first_name', 'last_name', 'title', 'company',
@@ -56,6 +58,7 @@ let api = (path, options) => fetch(path, options);
 let chosen = [];          // File objects staged for upload
 let pollTimer = null;
 let currentJobId = null;
+let lastProcessed = -1;   // drives the adaptive poll interval
 let objectUrls = [];      // thumbnail blob URLs, revoked on teardown
 
 /* ---------- small helpers ---------------------------------------------- */
@@ -269,19 +272,26 @@ function addAssistantTurn() {
   fill.className = 'meter__fill';
   meter.append(fill);
 
+  /* The estimate lives on its own line under the meter. aria-live="polite"
+     so a screen-reader user is told the remaining time as it changes, but is
+     never interrupted mid-sentence to hear it. */
+  const eta = document.createElement('p');
+  eta.className = 'reply__eta';
+  eta.setAttribute('aria-live', 'polite');
+
   const note = document.createElement('p');
   note.className = 'reply__note';
 
   const actions = document.createElement('div');
   actions.className = 'reply__actions';
 
-  card.append(status, meter, note, actions);
+  card.append(status, meter, eta, note, actions);
   // Returned below so finishReply can remove it once there is nothing to report.
   turn.append(who, card);
   thread.append(turn);
   turn.scrollIntoView({ behavior: 'smooth', block: 'end' });
 
-  return { card, statusText, fill, note, actions, meter };
+  return { card, statusText, fill, note, actions, meter, eta };
 }
 
 /* ---------- sending ------------------------------------------------------ */
@@ -338,14 +348,99 @@ function failReply(reply, message) {
   sendBtn.disabled = chosen.length === 0;
 }
 
+/* ---------- honest progress ---------------------------------------------- */
+
+/**
+ * "about 2 h 40 min", from seconds.
+ *
+ * Rounded coarsely ON PURPOSE. "2 h 41 min 12 s" claims a precision this
+ * estimate does not have -- it is derived from a handful of samples of a model
+ * whose per-card time varies with how much text is on the card. A number that
+ * looks exact invites people to trust it to the minute and then feel misled.
+ */
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  if (seconds < 90)   return 'under a minute';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60)   return `about ${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = Math.round((minutes % 60) / 15) * 15;   // quarter-hour buckets
+  if (rest === 0 || rest === 60) return `about ${hours + (rest === 60 ? 1 : 0)} h`;
+  return `about ${hours} h ${rest} min`;
+}
+
+/**
+ * How much longer this job has, measured from ITS OWN observed pace.
+ *
+ * WHY IT IS MEASURED AND NOT CONFIGURED. The brief is explicit that stub-server
+ * timings must never reach a user-facing estimate, and the reason generalises:
+ * a constant baked in from a developer's machine is wrong on every other
+ * machine, and wrong in the direction that matters -- a 2B model on shared CPU
+ * can take 4x what the same model takes on an idle box, and the same card
+ * varies with how densely it is printed. So the only honest source is this
+ * job's own elapsed time divided by the cards it has actually finished.
+ *
+ * BEFORE THE FIRST CARD FINISHES THERE IS NO ESTIMATE, and we say so rather
+ * than showing a number. A fabricated first guess is worse than silence: it
+ * anchors the user, and when the real pace turns out to be triple it, the
+ * feature has actively lied to them.
+ *
+ * THE MEAN, NOT THE LAST CARD. One slow card -- a retry, a dense card, another
+ * request stealing the model's single inference slot -- would otherwise make
+ * the estimate leap around every few minutes, which reads as broken even when
+ * each individual number is defensible.
+ */
+function estimateRemaining(job) {
+  const remaining = job.total - job.processed;
+  if (remaining <= 0) return '';
+  if (!job.processed) {
+    /* Say what is happening instead of showing a spinner with no content.
+       At >240s per card the first card alone is several minutes, and silence
+       for that long is indistinguishable from a hang. */
+    return 'Working out how long this will take — the first card sets the pace.';
+  }
+
+  const startedAt = new Date(job.created_at).getTime();
+  if (Number.isNaN(startedAt)) return '';
+  const elapsedSeconds = (Date.now() - startedAt) / 1000;
+  const perCard = elapsedSeconds / job.processed;
+
+  return `${formatDuration(perCard * remaining)} left · `
+       + `${Math.round(perCard)}s per card so far`;
+}
+
 /* ---------- polling ------------------------------------------------------ */
 
 /* setTimeout after each response rather than setInterval: setInterval fires on
    a fixed clock whether or not the previous request returned, so a slow server
    makes requests pile up on each other. Scheduling the next poll only AFTER
    the current one resolves keeps exactly one request in flight, always. */
+/* How long the job has looked unchanged, in poll ticks. Reset whenever a card
+   lands, so the interval snaps back to responsive the moment there is news. */
+let idlePolls = 0;
+
+/**
+ * How long to wait before the next poll.
+ *
+ * A fixed one-second interval was right when a card took a few seconds. At
+ * 260s per card it means ~260 requests to observe a single change, each one
+ * returning the ENTIRE growing lead set -- by card 40 that is a 40-row payload
+ * fetched 260 times to learn nothing. Backing off to 5s once nothing has moved
+ * cuts that by ~80% while still showing a completed card within five seconds
+ * of it landing, which is imperceptible against a four-minute card.
+ *
+ * Deliberately NOT derived from the measured per-card time: that would make
+ * the UI stop checking for minutes at a stretch, so a job that finished early
+ * -- or died -- would sit there looking busy. Five seconds is the floor on how
+ * stale the page is allowed to be, regardless of how slow the model is.
+ */
+function pollDelay() {
+  return idlePolls >= 5 ? SLOW_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+}
+
 function startPolling(jobId, total, reply) {
   currentJobId = jobId;
+  idlePolls = 0;
   reply.statusText.textContent = `Reading ${plural(total, 'card')}…`;
   poll(reply);
 }
@@ -357,6 +452,9 @@ async function poll(reply) {
     const response = await api(`/api/jobs/${currentJobId}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const job = await response.json();
+
+    idlePolls = job.processed === lastProcessed ? idlePolls + 1 : 0;
+    lastProcessed = job.processed;
 
     renderTable(reply, job.leads);
     /* Repainted from the poll response we already have rather than by
@@ -373,6 +471,7 @@ async function poll(reply) {
 
     reply.statusText.textContent =
       `Reading card ${Math.min(job.processed + 1, job.total)} of ${job.total}…`;
+    reply.eta.textContent = estimateRemaining(job);
   } catch (error) {
     /* Keep polling: a transient blip should not abandon a job that is still
        running perfectly well on the server. */
@@ -380,7 +479,7 @@ async function poll(reply) {
     reply.note.classList.add('is-trouble');
   }
 
-  pollTimer = setTimeout(() => poll(reply), POLL_INTERVAL_MS);
+  pollTimer = setTimeout(() => poll(reply), pollDelay());
 }
 
 /**
@@ -407,6 +506,9 @@ function finishReply(reply, job) {
 /** The presentational half: safe to call for any job, live or historical. */
 function paintReplyOutcome(reply, job) {
   reply.statusText.classList.remove('shimmer-text');
+  /* A finished job has nothing left to estimate; leaving the last figure on
+     screen would read as "still 40 minutes to go" next to a completed table. */
+  if (reply.eta) reply.eta.textContent = '';
   reply.meter.classList.add('is-done');
 
   if (job.status === 'failed') {
