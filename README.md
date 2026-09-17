@@ -155,9 +155,9 @@ llama.cpp, vLLM and OpenAI all speak. Switching backends is two variables.
 MODEL_URL=http://localhost:11434/v1/chat/completions
 MODEL_NAME=qwen2.5vl:3b
 
-# llama.cpp llama-server, e.g. a quantized Qwen3-VL-2B on an AWS CPU box
+# llama.cpp llama-server, if you swap Ollama out
 MODEL_URL=http://10.0.1.23:8080/v1/chat/completions
-MODEL_NAME=Qwen3-VL-2B-Instruct-Q4_K_M
+MODEL_NAME=Qwen2.5-VL-3B-Instruct-Q4_K_M
 ```
 
 ---
@@ -221,7 +221,9 @@ quadratic in edge length:
 1024 ×  768 resized      =  0.8 M px
 ```
 
-- **Latency:** on a CPU-hosted 2B model, that multiple is seconds versus minutes.
+- **Latency:** see [Performance](#performance) — on Ollama this turns out
+  **not** to reduce token count at all, because the model normalises the image
+  internally. The claim below is true of VLMs in general and false of this one.
 - **Memory:** vision tokens occupy the KV cache; a large enough image overruns
   the context window and the request fails outright.
 - **Accuracy does not improve to compensate.** Qwen2.5-VL and Qwen3-VL resize
@@ -293,8 +295,8 @@ formatting is done deterministically afterwards:
 
 ### 6. Bulk upload is a job queue, not a long request
 
-A CPU-hosted 2B VLM takes roughly 10–30s per card, so 50 cards is 15–25
-minutes. No HTTP request survives that: nginx's default `proxy_read_timeout`
+Qwen2.5-VL-3B on the target box takes **136–172s per card** — measured, not
+estimated — so 20 cards is roughly 45–57 minutes. No HTTP request survives that: nginx's default `proxy_read_timeout`
 and an AWS ALB's idle timeout are both **60 seconds**, and browsers abandon
 fetches. The connection would die minutes in and every completed result would
 be lost, because it only existed in that request's memory.
@@ -448,7 +450,7 @@ cost returns; it just moves somewhere concurrency can bound it.
 
 There is no evaluation set and no accuracy number in this README, because
 measuring it properly needs a labelled corpus of real cards. Expect a small
-quantized 2B model to struggle with: heavily stylised or script typefaces,
+3B model to struggle with: heavily stylised or script typefaces,
 low-contrast foil or embossed print, cards photographed at an angle, dual-language
 cards (it may return either language), and deciding which of three printed
 numbers is "the" phone number. `first_name`/`last_name` splitting is also

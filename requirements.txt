@@ -28,7 +28,7 @@ phonenumbers==9.0.39
 # GTK, Qt) that do not exist in a slim container and would not be used if they
 # did. Same cv2 module, ~35 MB smaller, no system packages to install.
 # numpy comes with it and is used only to pass pixel buffers between the two.
-opencv-python-headless==4.12.0.88
+opencv-python-headless==5.0.0.93
 
 # --- Persistence ---
 # Async SQLite driver. Needed because LeadStore's methods are async: the stdlib
