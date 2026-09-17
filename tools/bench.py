@@ -295,12 +295,27 @@ def main() -> int:
     parser.add_argument("--baseline", type=float, default=None,
                         help="seconds per card to compare against, e.g. 172")
     parser.add_argument("--out", type=pathlib.Path, default=None)
+    parser.add_argument("--no-reset", action="store_true",
+                        help="skip the cache reset before the first measurement")
     parser.add_argument("--label", default="",
                         help="prefix for the config column, e.g. 'keep_alive=-1'")
     args = parser.parse_args()
 
     cards = load_cards(args.cards)
-    print(f"{len(cards)} distinct cards, {len(LEAD_FIELDS)} fields each\n")
+    print(f"{len(cards)} distinct cards, {len(LEAD_FIELDS)} fields each")
+
+    # RESET BEFORE THE FIRST MEASUREMENT, NOT JUST BETWEEN REPEATS.
+    #
+    # Ollama's cache lives as long as the model stays loaded, which is across
+    # separate runs of this script. So re-running a configuration measured
+    # earlier in the session returns 1340 of 1341 tokens cached and a time that
+    # is not an inference. Without this, the benchmark is only correct the
+    # first time it is run after a reboot -- and silently wrong every time
+    # after, which is the worst possible property for a measurement tool.
+    if not args.no_reset:
+        print("resetting the model so the first measurement is cold…")
+        reset_cache(args.model)
+    print()
 
     rows = []
     first_call = True
