@@ -616,11 +616,23 @@ async function boot() {
 
   api = window.CardReaderAuth.makeApi(auth, showGate);
 
+  /* A one-line, credential-free view of where auth got to. Printing this
+     beats asking someone to paste a network request: those carry live session
+     tokens and cookies, and this carries neither. */
+  if (auth.enabled) {
+    console.info('[card-reader] auth', {
+      signedIn: auth.signedIn,
+      hasUser: Boolean(auth.clerk?.user),
+      hasSession: Boolean(auth.clerk?.session),
+      issuerHost: auth.host,
+    });
+  }
+
   if (!auth.enabled) {
     // Auth disabled server-side: straight into the app.
     gate.hidden = true;
     appRoot.hidden = false;
-  } else if (!auth.user) {
+  } else if (!auth.signedIn) {
     showGate();
     await presentSignIn(auth);
     /* Clerk fires this whenever the session changes. Reloading after sign-in

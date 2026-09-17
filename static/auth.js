@@ -85,7 +85,25 @@ async function initAuth() {
        bursting-turkey-6056.accounts.dev. Used only as a last resort, when
        neither the embedded form nor the modal works. */
     accountsHost: host.replace('.clerk.accounts.dev', '.accounts.dev'),
+    host,
     get user() { return window.Clerk.user; },
+    /**
+     * Whether this browser is signed in.
+     *
+     * Checks the SESSION as well as the user, not just the user. Clerk can
+     * hold a live session whose `user` has not been populated yet — a slow
+     * user fetch, or a browser blocking the cross-site storage Clerk would
+     * normally read it from. Gating on `user` alone therefore shows the
+     * sign-in screen to someone who is already signed in, and no amount of
+     * signing in again fixes it, because the session was never the problem.
+     *
+     * If a session exists, the server is the thing that decides whether its
+     * token is valid — so trusting it here costs nothing: a bad session simply
+     * 401s on the first API call and the gate comes back.
+     */
+    get signedIn() {
+      return Boolean(window.Clerk.user || window.Clerk.session);
+    },
     /**
      * A short-lived session JWT for the Authorization header.
      *
