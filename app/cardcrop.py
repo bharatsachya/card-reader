@@ -47,6 +47,22 @@ MAX_AREA_FRACTION = 0.97
 # near-square is not a card seen at an angle, it is something else.
 MIN_ASPECT, MAX_ASPECT = 1.15, 2.60
 
+# Expand the detected quad outward by this fraction before warping.
+#
+# ADDED AFTER A MEASURED FAILURE, not on principle. On a creased card
+# photographed against patterned fabric (samples/real/cl4.jpg), Canny traced a
+# contour slightly INSIDE the card's true edge, and the warp clipped the last
+# line of text -- the city -- clean off. The model then confidently reported
+# everything except the location, and nothing about the output looked wrong.
+#
+# The two directions of error are not equally bad. Overshoot and the crop
+# includes a sliver of desk, which costs nothing measurable: the model
+# normalises the image internally, so a few percent of extra background does
+# not change the token count at all. Undershoot and text is destroyed before
+# the model ever sees it, with no signal that it happened. So the tie is broken
+# outward, deliberately.
+QUAD_PAD_FRACTION = 0.025
+
 # Work at this width for detection. Contour finding does not need full
 # resolution and an 8 MP image makes Canny meaningfully slower for no gain;
 # the corners found here are scaled back up before the warp, so the final crop
@@ -157,6 +173,17 @@ def crop_to_card(image: Image.Image) -> Image.Image:
         # Back to original coordinates, so the warp samples full-resolution
         # pixels rather than the downscaled detection copy.
         quad = quad / scale
+
+        # Push each corner away from the centre. Scaling about the centroid
+        # keeps the quad's shape and angle, so the perspective correction is
+        # unaffected -- only the boundary moves outward.
+        centre = quad.mean(axis=0)
+        quad = centre + (quad - centre) * (1.0 + QUAD_PAD_FRACTION)
+        # Padding can push corners outside the frame. warpPerspective samples
+        # those as black rather than failing, which would put a dark band along
+        # the card edge; clamping keeps every sample inside real pixels.
+        quad[:, 0] = np.clip(quad[:, 0], 0, full_width - 1)
+        quad[:, 1] = np.clip(quad[:, 1], 0, full_height - 1)
 
         widths = (np.linalg.norm(quad[1] - quad[0]), np.linalg.norm(quad[2] - quad[3]))
         heights = (np.linalg.norm(quad[3] - quad[0]), np.linalg.norm(quad[2] - quad[1]))
