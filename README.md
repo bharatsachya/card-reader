@@ -72,6 +72,9 @@ curl -s localhost:8000/api/model-check                    # is the MODEL up?
              GET /api/jobs/{id}  │ polled once a second
 ```
 
+*Measured performance, and one significant negative result, are in
+[Performance](#performance).*
+
 ### Why it is split this way
 
 **The model call is the only non-deterministic step.** Everything before and
@@ -399,6 +402,161 @@ It is three static files. Hosting them separately (S3/CloudFront/nginx) would
 add cost, a deploy step and CORS configuration in exchange for nothing — the
 app server is idle-waiting on the model anyway. Same-origin also means `fetch`
 needs no CORS headers at all.
+
+---
+
+## Performance
+
+All numbers here were measured on the deployment box — AWS `m7i-flex.large`,
+2 vCPU, 7.6 GiB, no GPU, Ubuntu 24.04 — against `qwen2.5vl:3b` served by
+Ollama. **No number in this section comes from the stub server**, and the
+harness that produced them (`tools/bench.py`) is built so that it cannot
+quietly produce one.
+
+### How these were measured, and the trap that makes most such tables wrong
+
+Ollama caches the prompt prefix. Send the same image twice and the second call
+returns in **22s** against **172s**, with `cached_tokens` covering essentially
+the whole prompt. Any benchmark that reuses an image reports that as a 7.8×
+speedup.
+
+This repository shipped with exactly that landmine: **twelve of the thirteen
+images in `samples/batch/` are byte-identical.** A resolution sweep pointed at
+that directory would have produced a confident, completely fictional table.
+
+So the harness:
+
+* verifies every card in the corpus is distinct **before** taking a timing, and
+  aborts if two hash the same;
+* reads `cached_tokens` back from every response and refuses to average a cache
+  hit into a median;
+* evicts the model before the first measurement, because Ollama's cache
+  survives across separate runs of the script — which meant the benchmark was
+  only trustworthy the first time it ran after a reboot, and silently wrong
+  every run after.
+
+The threshold for "this is a cache hit" is 60% of prompt tokens, not zero. The
+first version demanded zero and aborted a legitimate run: 299 of 1,341 tokens
+were the **system prompt**, which is identical on every request by
+construction. Those 299 are cached in normal operation too — a small, real
+speedup that costs nothing.
+
+### A2 — Input resolution: a negative result, and the most useful one
+
+The hypothesis was that resizing is the biggest available lever, because vision
+tokens scale with image area. **It is not, on this runtime.**
+
+| long edge sent | pixels sent | prompt tokens | wall time |
+|---|---|---|---|
+| 1024 px | 1024×768 | **1,341** | 169 s |
+| 448 px | 448×336 | **1,341** | 169 s |
+| 320 px | 320×240 | **1,341** | 136 s |
+| 256 px | 256×192 | **1,341** | 137 s |
+
+Prompt tokens are **flat at 1,341 across a 16× range of input pixels**. Ollama
+resizes to a fixed grid before the vision encoder, so the resize this
+application performs is discarded — the model literally cannot tell a 256 px
+input from a 1024 px one in token terms.
+
+**The conclusion is about the runtime, not the parameter.** `MAX_IMAGE_EDGE`
+cannot reduce inference cost here at all. Getting control of image token count
+requires a serving stack that exposes it — vLLM's `--limit-mm-per-prompt`, or
+llama.cpp with explicit projector settings. Swapping runtimes is a two-env-var
+change by design (see [Model backends](#model-backends)), so this is a
+configuration decision rather than a rewrite.
+
+The resize is **kept anyway**, for two reasons that survive the finding: it
+bounds upload size and decode memory (`MAX_CONCURRENCY × ~100 MB` peak), and it
+keeps behaviour identical if the backend is swapped for one where resolution
+*does* matter.
+
+This also retroactively explains something that should have been suspicious
+earlier: the baseline barely moved between 768 px and 1024 px. It was not noise.
+It was the resize being thrown away.
+
+### A1 — Keeping the model resident
+
+Ollama unloads an idle model after 5 minutes by default, so the next card pays
+a 3.2 GB reload on top of inference. `OLLAMA_KEEP_ALIVE=-1` is set by
+`deploy/deploy.sh`.
+
+| condition | wall time |
+|---|---|
+| cold — first card after a reboot, model not loaded | **181 s** |
+| warm — model resident | **167 s** |
+
+≈ **14 s** of reload amortised away per idle gap. On a box where cards arrive
+in bursts minutes apart, that reload was being paid repeatedly for no reason;
+the machine has 7.6 GiB and nothing else wants the RAM.
+
+*These two figures are incidental — taken during deployment verification rather
+than from a controlled run of five cold against five warm. They are consistent
+with the mechanism but they are a sample of one each, and are labelled as such.*
+
+### A3 — Card detection and perspective crop
+
+A phone photo of a business card is mostly desk. Across the twelve test images
+the card occupies **67% of the frame on average**, so a third of every image is
+fabric or granite that costs exactly as much as a phone number.
+
+Because A2 showed token count is fixed, **cropping cannot make inference
+faster.** What it changes is *what those 1,341 tokens contain*: after cropping,
+the fixed token budget is spent on card instead of background, which raises the
+effective resolution of the text. The win moves from latency to accuracy.
+
+| | result |
+|---|---|
+| cards detected | **10 of 12** |
+| fallback (no plausible quad) | 2 of 12 — original image passed through unchanged |
+| pixels removed when detected | **33% on average**, best case 59% |
+| detection cost | 15–110 ms per image |
+
+<!--A3_ACCURACY-->
+
+The module is built so every failure path returns the original image. A
+detector that occasionally returns a confident crop of the *wrong* rectangle is
+worse than one that often declines, because a wrong crop deletes part of the
+card and the model dutifully reports what is left.
+
+That is not hypothetical. On a creased card photographed against patterned
+fabric, Canny traced a contour just inside the true edge and the warp clipped
+the city off the bottom; the model then returned every field except `location`
+and nothing about the output looked wrong. The quad is now expanded 2.5%
+outward before warping — overshooting costs a sliver of desk, which is free
+because tokens are fixed, while undershooting destroys text silently.
+
+### A4 — Not evaluated
+
+Quantization variants (`q4_0` vs the default `q4_K_M`) and smaller models such
+as `moondream` (~1.8B) are the **remaining latency lever**, and specifically
+because of the A2 result: if input size cannot reduce token cost, then reducing
+the cost *per token* is what is left.
+
+They were not evaluated within the time available. Each variant is a fresh
+multi-gigabyte download plus a full benchmark pass at ~170 s per card on two
+cores, and a result that is not measured properly is worse than an absent one.
+Naming the next experiment and why it was not run is the honest version of this
+section.
+
+### Chosen configuration, and why
+
+| setting | value | reason |
+|---|---|---|
+| `MODEL_TIMEOUT_SECONDS` | 600 | Slowest measured card is 172 s; 180 left no headroom, and a timeout mid-card discards the compute already spent |
+| `MODEL_MAX_ATTEMPTS` | 2 | At a 600 s timeout, 3 attempts is 30 min on one stuck card. Connection-refused still fails fast |
+| `MAX_CONCURRENCY` | 1 | Ollama already saturates both vCPUs on one inference (92%/81% measured); parallelism splits the same cores |
+| `MAX_FILES_PER_REQUEST` | 20 | 50 × 172 s = 2 h 23 m in a single request. 20 keeps the worst case under an hour |
+| `max_tokens` | 256 | Observed completion length is 83–86 tokens; 256 is triple the need and still bounds a rambling reply |
+| `MAX_IMAGE_EDGE` | 1024 | **Does not affect inference cost on Ollama** (A2). Retained to bound upload size and decode memory |
+| `OLLAMA_KEEP_ALIVE` | -1 | Saves ≈14 s per idle gap |
+
+### What this means for a 20-card batch
+
+At 167 s per card with concurrency 1: **≈ 56 minutes**. The UI shows a per-card
+ETA computed from the job's own observed pace rather than a configured
+constant, because the same model varies several-fold between an idle box and a
+busy one. Until the first card completes there is no estimate and the page says
+so — a fabricated first guess anchors the user and then turns out to be triple.
 
 ---
 
@@ -781,6 +939,59 @@ turning a downstream slowdown into a restart loop.
 
 Check dependencies on a separate, slower endpoint that humans call
 deliberately.
+
+---
+
+## AI usage, and what was rejected
+
+This project was built with Claude. That is only useful information if it comes
+with the corrections, so this is a record of where the AI's proposals were
+wrong, overruled, or disproved by measurement — not a list of what it produced.
+
+### Direction changes made by the human
+
+| Proposal | Outcome |
+|---|---|
+| Deploy the app to **Azure Container Apps** with an Ollama sidecar | **Overruled.** Colocated on the existing EC2 box instead. Better on every axis: Ollama stays on `127.0.0.1` and is unreachable from the internet, SQLite gets a real local filesystem instead of SMB (where its locking is unreliable), no card image crosses the public network, and the app is ~0.05% of the CPU cost of a card so it costs nothing to host beside the model |
+| Serve the **frontend from Vercel** | **Raised by the human, argued against, dropped.** `GET /` is not static — it strips the sign-in markup server-side based on `AUTH_MODE` — so splitting it would move that decision back into the browser, which this codebase deliberately moved out of it, and would add CORS for no gain |
+| **Port-scan** the model host to discover its port | **Stopped by the human.** Replaced by asking directly |
+| Ask deployment questions through a **structured form** | **Rejected.** Plain numbered questions instead |
+| Run `git init` + `echo "# card-reader" >> README.md` as given | **Declined by the AI.** The repository already had eight commits, and that `echo` would have appended a stray heading to this file |
+| Model described throughout as **2B** | **Corrected by the human** to Qwen2.5-VL-**3B** |
+| **`MODEL_API_KEY`** proposed to secure the Ollama endpoint | **Wrong, withdrawn.** Ollama has no built-in authentication and ignores the header. Network-level restriction is the only real control |
+| Claimed **port 80 was blocked** by the security group | **Wrong, corrected by the human.** Inferred from a listening-port list rather than tested; a single connect showed a 212 ms refusal, not a timeout |
+| Evaluate **quantization variants and moondream** (A4) | **Descoped by the human.** Each is a multi-gigabyte download plus a full pass at ~170 s per card; a result that is not measured properly is worse than an absent one. Recorded as the named next experiment instead |
+
+### Where the measurement overruled the plan
+
+The resolution sweep (A2) was specified as *"expected to be the biggest win."*
+It was not. Prompt tokens are flat at 1,341 from 256 px to 1024 px, because
+Ollama resizes to a fixed grid before the vision encoder. The client-side
+resize is inert on this runtime.
+
+That reframed the crop work (A3) rather than invalidating it: if the token
+count is fixed, the only remaining lever is *what those tokens contain*, so
+cropping the desk away became an accuracy change rather than a latency one.
+
+### Mistakes the AI made that were caught by tooling, not by review
+
+* **A benchmark that would have lied.** The first cache check demanded
+  `cached_tokens == 0` and aborted a valid run — 299 tokens were the system
+  prompt. Left unexamined in the other direction, the same harness would have
+  averaged genuine 22 s cache hits into a median and reported a 7.8× speedup.
+* **A crop that silently destroyed data.** Card detection clipped the city off
+  a creased card; the model then returned six of seven fields and nothing
+  looked wrong. Found by looking at the cropped image, not by reading the code.
+* **Fifteen minutes of benchmark data lost.** Python block-buffers stdout when
+  redirected; the risk was noticed, deprioritised, and then cost every
+  measurement taken before the run was stopped.
+* **Two CI failures from linting individual files** instead of the whole tree
+  the way CI does — including one "fix" that did not fix the problem.
+* **`--require-hashes=false`** in the Dockerfile: not a real pip flag. Unreachable
+  locally because the development machine had no Docker daemon; CI caught it.
+* **`pytest` vs `python -m pytest`**: 73 tests passed locally and every module
+  failed to import in CI, because `-m` silently puts the working directory on
+  `sys.path` and the bare entry point does not.
 
 ---
 
