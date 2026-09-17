@@ -360,7 +360,17 @@ h1, h2, h3 {
 
 /* Phone and email in mono: tabular digits make a misparsed E164 number or a
    wrong domain obvious while scanning fifty rows. Functional, not decorative. */
-.leads .mono { font-family: var(--font-mono); font-size: 0.75rem; white-space: nowrap; }
+.leads .mono { font-family: var(--font-mono); font-size: 0.75rem; }
+
+/* A phone number is short and must never break mid-number — a wrapped E164
+   string is unreadable and un-copyable. */
+.leads td.mono.phone { white-space: nowrap; }
+
+/* An email is long and WILL be the widest cell in the table. Left to nowrap it
+   pushed the table past the card and the address was clipped with no way to
+   see it. Allowed to wrap instead: the column stays inside the card and the
+   whole address is readable, which matters more than keeping it on one line. */
+.leads td.mono.email { overflow-wrap: anywhere; min-width: 14ch; }
 .leads .missing { color: color-mix(in srgb, var(--ink) 30%, transparent); }
 
 .leads .source {
@@ -571,3 +581,8 @@ h1, h2, h3 {
 .diag dd.ok { color: var(--steel-700); }
 .diag dd.bad { color: var(--alarm); }
 .diag .btn { width: 100%; }
+
+/* A progress meter that has finished is not information, it is a full bar
+   sitting under a sentence that already says the job is done. Removed on
+   completion rather than left at 100%. */
+.meter.is-done { display: none; }

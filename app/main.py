@@ -9,7 +9,7 @@ import pathlib
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi import Depends, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.auth import User, require_user
@@ -98,12 +98,44 @@ class NoCacheStatic(StaticFiles):
 app.mount("/static", NoCacheStatic(directory=STATIC_DIR), name="static")
 
 
+def _strip_between(html: str, start: str, end: str) -> str:
+    """Remove everything between two marker comments, inclusive."""
+    head, marker, rest = html.partition(start)
+    if not marker:
+        return html
+    _removed, marker, tail = rest.partition(end)
+    return head + tail if marker else html
+
+
 @app.get("/", include_in_schema=False)
-def index() -> FileResponse:
-    """Serve the single-page UI."""
-    return FileResponse(
-        STATIC_DIR / "index.html",
-        headers={"Cache-Control": "no-store, must-revalidate"},
+def index() -> HTMLResponse:
+    """
+    Serve the single-page UI, with the sign-in screen removed when auth is off.
+
+    WHY THIS IS DECIDED ON THE SERVER RATHER THAN IN THE BROWSER:
+
+    The page used to always contain the gate and let JavaScript hide it after
+    asking /api/auth-config. That put the decision behind two things that can
+    go stale independently -- the cached script and the cached config response
+    -- and when either did, the browser showed a sign-in screen for an app that
+    has no sign-in, and no amount of restarting the server changed it because
+    the server was never consulted.
+
+    Not sending markup the user can never use removes that whole class of
+    failure: there is no gate in the document to be shown by mistake, and the
+    app is visible without JavaScript having to reveal it.
+    """
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    if not settings.auth_enabled:
+        html = _strip_between(html, "<!--GATE_START-->", "<!--GATE_END-->")
+        html = _strip_between(html, "<!--AUTHJS_START-->", "<!--AUTHJS_END-->")
+        # The app div is hidden by default so the gate can own the screen on
+        # first paint. With no gate, it must start visible.
+        html = html.replace('<div id="app" hidden>', '<div id="app">')
+
+    return HTMLResponse(
+        html, headers={"Cache-Control": "no-store, must-revalidate"}
     )
 
 

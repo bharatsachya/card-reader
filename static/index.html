@@ -14,6 +14,7 @@
 </head>
 <body>
 
+<!--GATE_START-->
 <!-- The sign-in gate. Shown until Clerk reports a signed-in user; the app
      behind it is inert until then. This is presentation only — the server
      enforces access independently (app/auth.py). -->
@@ -59,6 +60,7 @@
     </div>
   </div>
 </div>
+<!--GATE_END-->
 
 <div id="app" hidden>
 <header class="topbar">
@@ -109,7 +111,7 @@
 
 </div><!-- /#app -->
 
-<script src="/static/auth.js"></script>
+<!--AUTHJS_START--><script src="/static/auth.js"></script><!--AUTHJS_END-->
 <script src="/static/app.js"></script>
 </body>
 </html>

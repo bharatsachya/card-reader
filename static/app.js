@@ -276,11 +276,12 @@ function addAssistantTurn() {
   actions.className = 'reply__actions';
 
   card.append(status, meter, note, actions);
+  // Returned below so finishReply can remove it once there is nothing to report.
   turn.append(who, card);
   thread.append(turn);
   turn.scrollIntoView({ behavior: 'smooth', block: 'end' });
 
-  return { card, statusText, fill, note, actions };
+  return { card, statusText, fill, note, actions, meter };
 }
 
 /* ---------- sending ------------------------------------------------------ */
@@ -377,6 +378,7 @@ function finishReply(reply, job) {
   sendBtn.disabled = chosen.length === 0;
 
   reply.statusText.classList.remove('shimmer-text');
+  reply.meter.classList.add('is-done');
 
   if (job.status === 'failed') {
     reply.statusText.textContent = 'The job stopped early.';
@@ -485,7 +487,9 @@ function renderTable(reply, leads) {
 
       if (value) {
         td.textContent = value;        // model output → textContent. See header.
-        if (MONO.has(column)) td.className = 'mono';
+        // The column name rides along so phone and email can be treated
+        // differently: one must not wrap, the other must.
+        if (MONO.has(column)) td.className = `mono ${column}`;
       } else {
         td.textContent = '—';
         td.className = 'missing';
@@ -736,14 +740,21 @@ function openClerk(auth, which) {
 /* Nothing renders until we know whether there is a user. Showing the app and
    then yanking it away when auth resolves is worse than a beat of nothing. */
 async function boot() {
-  const auth = await window.CardReaderAuth.initAuth();
+  /* auth.js is not served at all when auth is disabled, so its absence is a
+     normal state rather than an error. */
+  const auth = window.CardReaderAuth
+    ? await window.CardReaderAuth.initAuth()
+    : { enabled: false, getToken: async () => null, user: null, signedIn: false };
 
   const showGate = () => {
+    if (!gate) return;          // no gate in the document when auth is off
     gate.hidden = false;
     appRoot.hidden = true;
   };
 
-  api = window.CardReaderAuth.makeApi(auth, showGate);
+  api = window.CardReaderAuth
+    ? window.CardReaderAuth.makeApi(auth, showGate)
+    : (path, options) => fetch(path, options);
 
   /* A one-line, credential-free view of where auth got to. Printing this
      beats asking someone to paste a network request: those carry live session
@@ -758,8 +769,8 @@ async function boot() {
   }
 
   if (!auth.enabled) {
-    // Auth disabled server-side: straight into the app.
-    gate.hidden = true;
+    // Auth disabled server-side: the gate was never sent, so just show the app.
+    if (gate) gate.hidden = true;
     appRoot.hidden = false;
   } else if (!auth.signedIn) {
     showGate();
