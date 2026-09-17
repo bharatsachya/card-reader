@@ -88,8 +88,8 @@ def _order_corners(points: np.ndarray) -> np.ndarray:
     diff = np.diff(points, axis=1).ravel()
     ordered[0] = points[np.argmin(total)]   # top-left
     ordered[2] = points[np.argmax(total)]   # bottom-right
-    ordered[1] = points[np.argmax(diff * -1)] if False else points[np.argmin(diff)]
-    ordered[3] = points[np.argmax(diff)]
+    ordered[1] = points[np.argmin(diff)]    # top-right
+    ordered[3] = points[np.argmax(diff)]    # bottom-left
     return ordered
 
 
