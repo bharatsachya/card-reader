@@ -3,9 +3,9 @@ The background worker that processes a bulk upload.
 
 WHY A JOB QUEUE AT ALL (the core scaling decision):
 
-A CPU-hosted Qwen2.5-VL-3B takes 136-172 seconds per card -- MEASURED on
-the target box, not estimated. A 20-card batch is roughly 50 minutes. You cannot hold an HTTP request open
-for that:
+A CPU-hosted Qwen2.5-VL-3B takes 136-172 seconds per card -- MEASURED on the
+target box, not estimated. A 20-card batch is therefore roughly 50 minutes of
+work, and you cannot hold an HTTP request open for that:
   * browsers abandon fetches,
   * nginx's default proxy_read_timeout is 60s,
   * an AWS ALB's default idle timeout is 60s.
