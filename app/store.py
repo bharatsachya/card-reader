@@ -110,6 +110,34 @@ class SessionPage:
     next_cursor: Optional[str] = None
 
 
+def _median_seconds_per_card(
+    jobs: list[tuple[str, Optional[str], int]],
+) -> Optional[float]:
+    """Median per-card duration over (created_at, finished_at, card_count)."""
+    rates = []
+    for created_at, finished_at, cards in jobs:
+        if not finished_at or cards <= 0:
+            continue
+        try:
+            span = (
+                datetime.fromisoformat(finished_at)
+                - datetime.fromisoformat(created_at)
+            ).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        # A per-card time of zero or negative means the clock moved or the
+        # row is malformed; either way it is not evidence about the model.
+        if span > 0:
+            rates.append(span / cards)
+    if not rates:
+        return None
+    rates.sort()
+    middle = len(rates) // 2
+    if len(rates) % 2:
+        return rates[middle]
+    return (rates[middle - 1] + rates[middle]) / 2
+
+
 def default_session_title(when: Optional[str] = None) -> str:
     """
     A readable default, e.g. "18 Sep 2026, 14:32".
@@ -349,6 +377,27 @@ class LeadStore(ABC):
         """
 
     @abstractmethod
+    async def typical_seconds_per_card(self, user_id: str) -> Optional[float]:
+        """
+        Median seconds per card across this user's finished jobs, or None.
+
+        THIS IS MEASURED, NOT CONFIGURED, AND THE DIFFERENCE IS THE POINT.
+        It is computed from jobs that actually completed on THIS machine, so it
+        reflects the hardware, the model and the load the user is really on. A
+        constant baked into the code would be wrong on every box except the one
+        it was measured on, and would go stale the moment MODEL_URL moved.
+
+        None until at least one job has finished, and the caller must handle
+        that rather than substituting a guess -- the first ever card genuinely
+        has nothing to predict from, and inventing a number for it is how a
+        progress bar starts lying.
+
+        The MEDIAN, not the mean: one pathological card (a retry, a reload, a
+        dense layout) would drag a mean far enough to make every subsequent
+        estimate wrong in the same direction.
+        """
+
+    @abstractmethod
     async def delete_everything_for(self, user_id: str) -> int:
         """
         Delete every session, job and lead belonging to this user. Returns the
@@ -511,6 +560,13 @@ class InMemoryLeadStore(LeadStore):
                 encode_cursor(page[-1]) if has_more and page else None
             ),
         )
+
+    async def typical_seconds_per_card(self, user_id: str) -> Optional[float]:
+        async with self._lock:
+            jobs = [j for j in self._jobs.values()
+                    if j.user_id == user_id and j.finished_at and j.leads]
+        return _median_seconds_per_card(
+            [(j.created_at, j.finished_at, len(j.leads)) for j in jobs])
 
     async def delete_everything_for(self, user_id: str) -> int:
         async with self._lock:
@@ -1107,6 +1163,27 @@ class SqliteLeadStore(LeadStore):
                 encode_cursor(sessions[-1]) if has_more and sessions else None
             ),
         )
+
+    async def typical_seconds_per_card(self, user_id: str) -> Optional[float]:
+        query = """
+            SELECT j.created_at, j.finished_at, COUNT(l.id) AS cards
+            FROM jobs j
+            JOIN leads l ON l.job_id = j.id
+            WHERE j.user_id = ? AND j.finished_at IS NOT NULL
+              AND j.status = 'done'
+            GROUP BY j.id
+            ORDER BY j.created_at DESC
+            LIMIT 20
+        """
+        # Only the last 20, and only jobs that reached 'done'. Recent work is
+        # the better predictor if the box or the model changed, and a job that
+        # failed part way through has a finished_at that measures how long it
+        # took to give up, not how long a card takes.
+        async with self._connect() as conn:
+            async with conn.execute(query, (user_id,)) as cursor:
+                rows = await cursor.fetchall()
+        return _median_seconds_per_card(
+            [(r["created_at"], r["finished_at"], r["cards"]) for r in rows])
 
     async def delete_everything_for(self, user_id: str) -> int:
         # Deleted explicitly, level by level, rather than relying on ON DELETE

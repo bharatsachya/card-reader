@@ -553,7 +553,24 @@ async def get_job(
     # nothing they did not already know. Same response either way.
     if job is None or not job.owned_by(user.id):
         raise HTTPException(status_code=404, detail=f"unknown job: {job_id}")
-    return job.summary() if summary else job.to_dict()
+
+    payload = job.summary() if summary else job.to_dict()
+
+    # How long a card has actually taken on this machine, measured from this
+    # user's finished jobs. Sent while the job is running so the client can
+    # show progress WITHIN a card rather than only between them: a card takes
+    # 130-175s here, so per-card granularity means the bar moves roughly twice
+    # an hour on a large batch.
+    #
+    # Deliberately null until there is history. The alternative -- a default
+    # constant -- would be wrong on every machine except the one it was
+    # measured on, and would go stale the moment MODEL_URL pointed elsewhere.
+    # The client renders an elapsed counter instead when this is absent.
+    if job.status in {"queued", "running"}:
+        payload["typical_seconds_per_card"] = (
+            await store.typical_seconds_per_card(user.id)
+        )
+    return payload
 
 
 # --------------------------------------------------------------------------

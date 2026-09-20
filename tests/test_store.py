@@ -233,3 +233,53 @@ async def test_session_pagination_is_stable(store):
         cursor = page.next_cursor
     assert seen == list(reversed(created))
     assert len(seen) == len(set(seen))
+
+
+# --- measured per-card timing ---------------------------------------------
+
+async def test_no_timing_prior_until_a_job_has_finished(store):
+    """
+    None, not a guess. The first card genuinely has nothing to predict from,
+    and inventing a number is how a progress bar starts lying.
+    """
+    assert await store.typical_seconds_per_card("u1") is None
+    job = await store.create_job(total=1, user_id="u1")
+    await store.append_lead(job.id, Lead(first_name="A"))
+    # still running -> still no prior
+    assert await store.typical_seconds_per_card("u1") is None
+
+
+async def test_timing_prior_is_per_card_not_per_job(store):
+    from app.store import _median_seconds_per_card
+    # 300s for 2 cards is 150s per card, not 300.
+    assert _median_seconds_per_card([
+        ("2026-09-20T10:00:00+00:00", "2026-09-20T10:05:00+00:00", 2),
+    ]) == 150
+
+
+async def test_timing_prior_uses_the_median(store):
+    from app.store import _median_seconds_per_card
+    # One pathological card must not drag the estimate.
+    rates = _median_seconds_per_card([
+        ("2026-09-20T10:00:00+00:00", "2026-09-20T10:02:30+00:00", 1),   # 150
+        ("2026-09-20T11:00:00+00:00", "2026-09-20T11:02:40+00:00", 1),   # 160
+        ("2026-09-20T12:00:00+00:00", "2026-09-20T13:00:00+00:00", 1),   # 3600
+    ])
+    assert rates == 160, f"a mean would have given {(150+160+3600)/3:.0f}"
+
+
+async def test_timing_prior_ignores_nonsense_rows(store):
+    from app.store import _median_seconds_per_card
+    assert _median_seconds_per_card([
+        ("2026-09-20T10:00:00+00:00", None, 1),                          # unfinished
+        ("2026-09-20T10:00:00+00:00", "2026-09-20T10:05:00+00:00", 0),   # no cards
+        ("2026-09-20T10:05:00+00:00", "2026-09-20T10:00:00+00:00", 1),   # clock moved
+        ("not-a-date", "2026-09-20T10:05:00+00:00", 1),                  # malformed
+    ]) is None
+
+
+async def test_timing_prior_is_scoped_per_user(store):
+    job = await store.create_job(total=1, user_id="alice")
+    await store.append_lead(job.id, Lead(first_name="A"))
+    await store.set_status(job.id, "done")
+    assert await store.typical_seconds_per_card("bob") is None

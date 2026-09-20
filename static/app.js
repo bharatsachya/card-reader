@@ -448,6 +448,48 @@ function formatDuration(seconds) {
  * the estimate leap around every few minutes, which reads as broken even when
  * each individual number is defensible.
  */
+/**
+ * Where to put the bar, in percent.
+ *
+ * WITHOUT A MEASURED PER-CARD TIME this can only be processed/total, which on
+ * this hardware moves once every 130-175 seconds. On a twenty-card batch that
+ * is a bar that advances five percent twice an hour, and between those jumps
+ * it is indistinguishable from a stalled one.
+ *
+ * WITH ONE -- the median of cards that actually finished on this machine, sent
+ * by the server -- the position inside the current card can be interpolated
+ * from elapsed time, so the bar moves continuously and means something.
+ *
+ * Two rules keep it honest:
+ *   * it never runs past the card it is on, so a slow card cannot make the bar
+ *     claim a card finished that has not;
+ *   * it never goes backwards, because a bar that retreats reads as an error
+ *     even when the new estimate is better.
+ */
+let lastPercent = 0;
+
+function progressPercent(job) {
+  if (!job.total) return 0;
+  const done = job.processed / job.total;
+
+  const perCard = job.typical_seconds_per_card;
+  const startedAt = new Date(job.created_at).getTime();
+  if (!perCard || Number.isNaN(startedAt)) {
+    lastPercent = Math.max(lastPercent, Math.round(done * 100));
+    return lastPercent;
+  }
+
+  const elapsed = (Date.now() - startedAt) / 1000;
+  const spentOnCurrent = Math.max(0, elapsed - job.processed * perCard);
+  /* Capped at 0.95 of one card: the last sliver is held back so the bar does
+     not sit at a completed-looking position while the model is still going. */
+  const withinCurrent = Math.min(spentOnCurrent / perCard, 0.95) / job.total;
+
+  lastPercent = Math.max(
+    lastPercent, Math.round(Math.min(done + withinCurrent, 0.99) * 100));
+  return lastPercent;
+}
+
 /** "1m 47s", for a counter that has to visibly move every second. */
 function elapsedLabel(seconds) {
   const whole = Math.max(0, Math.floor(seconds));
@@ -462,6 +504,15 @@ function estimateRemaining(job) {
   const startedAt = new Date(job.created_at).getTime();
   const elapsed = Number.isNaN(startedAt) ? 0 : (Date.now() - startedAt) / 1000;
 
+  if (!job.processed && job.typical_seconds_per_card) {
+    /* We have a measured pace from earlier cards on this machine, so the very
+       first card can be estimated after all -- and the estimate is labelled as
+       coming from past runs rather than from this one, because it is. */
+    const total = job.typical_seconds_per_card * job.total;
+    return `${formatDuration(Math.max(total - elapsed, 0))} left · `
+         + `${elapsedLabel(elapsed)} elapsed · `
+         + `~${Math.round(job.typical_seconds_per_card)}s per card on this machine`;
+  }
   if (!job.processed) {
     /* THE FIRST CARD IS THE WORST CASE AND IT USED TO SAY NOTHING USEFUL.
        Until a card finishes there is no pace to extrapolate from, so this line
@@ -526,6 +577,10 @@ function startElapsedTicker(reply, job) {
   elapsedTicker = setInterval(() => {
     if (!reply.eta || !document.contains(reply.eta)) { stopElapsedTicker(); return; }
     reply.eta.textContent = estimateRemaining(job);
+    /* The bar is advanced by the ticker too, not only by the poll: with a
+       measured per-card time it has a new position every second, and waiting
+       for a poll that has backed off to five seconds would make it step. */
+    reply.fill.style.width = `${progressPercent(job)}%`;
   }, 1000);
 }
 
@@ -537,6 +592,7 @@ function stopElapsedTicker() {
 function startPolling(jobId, total, reply) {
   currentJobId = jobId;
   idlePolls = 0;
+  lastPercent = 0;   // a new job starts from the left, not from the last one
   reply.statusText.textContent = `Reading ${plural(total, 'card')}…`;
   poll(reply);
 }
@@ -553,12 +609,13 @@ async function poll(reply) {
     lastProcessed = job.processed;
 
     renderTable(reply, job.leads);
-    const pct = job.total ? Math.round((job.processed / job.total) * 100) : 0;
+
+    const pct = progressPercent(job);
     reply.fill.style.width = `${pct}%`;
-    /* Before the first card lands the bar has nothing to show, so it animates
-       instead of sitting at zero. A 0% bar and a 0%-but-working bar look
-       identical, and only one of them is a problem. */
-    reply.meter.classList.toggle('is-waiting', job.processed === 0);
+    /* The sweep is only for when we genuinely cannot estimate. With a measured
+       per-card time the bar shows a real (if interpolated) position instead. */
+    reply.meter.classList.toggle(
+      'is-waiting', job.processed === 0 && !job.typical_seconds_per_card);
     /* Re-seeded each poll so the ticker extrapolates from fresh counters
        rather than the job object captured when polling began. */
     startElapsedTicker(reply, job);
