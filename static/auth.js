@@ -138,6 +138,12 @@ function makeApi(auth, onUnauthenticated) {
     const headers = new Headers(options.headers || {});
     const token = await auth.getToken();
     if (token) headers.set('Authorization', `Bearer ${token}`);
+    /* Carried in both modes so one wrapper serves both. The server ignores it
+       entirely when AUTH_MODE=clerk -- honouring a client-supplied identity
+       there would be a trivial bypass of the signature check. */
+    if (window.cardReaderClientId) {
+      headers.set('X-Client-Id', window.cardReaderClientId);
+    }
 
     const response = await fetch(path, { ...options, headers });
 

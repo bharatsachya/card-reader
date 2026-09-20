@@ -349,6 +349,19 @@ class LeadStore(ABC):
         """
 
     @abstractmethod
+    async def delete_everything_for(self, user_id: str) -> int:
+        """
+        Delete every session, job and lead belonging to this user. Returns the
+        number of sessions removed.
+
+        Backs the "clear my history" control. Rotating the browser's id alone
+        would only make the old rows UNREACHABLE, not gone -- and telling
+        someone their data is erased when it is merely hidden is the kind of
+        claim that is worth getting right. The retained images are left to the
+        startup sweep, which deletes any file no lead references.
+        """
+
+    @abstractmethod
     async def session_leads(self, session_id: str, user_id: str) -> list[Lead]:
         """Every lead in a session, in the order they were extracted."""
 
@@ -498,6 +511,17 @@ class InMemoryLeadStore(LeadStore):
                 encode_cursor(page[-1]) if has_more and page else None
             ),
         )
+
+    async def delete_everything_for(self, user_id: str) -> int:
+        async with self._lock:
+            session_ids = {s.id for s in self._sessions.values()
+                           if s.user_id == user_id}
+            for job_id in [j.id for j in self._jobs.values()
+                           if j.user_id == user_id]:
+                del self._jobs[job_id]
+            for session_id in session_ids:
+                del self._sessions[session_id]
+        return len(session_ids)
 
     async def session_jobs(self, session_id: str, user_id: str) -> list[Job]:
         if await self.get_session(session_id, user_id) is None:
@@ -1083,6 +1107,27 @@ class SqliteLeadStore(LeadStore):
                 encode_cursor(sessions[-1]) if has_more and sessions else None
             ),
         )
+
+    async def delete_everything_for(self, user_id: str) -> int:
+        # Deleted explicitly, level by level, rather than relying on ON DELETE
+        # CASCADE. The cascade is declared in the schema, but a database
+        # upgraded from before sessions existed has session_id added by
+        # ALTER TABLE -- and SQLite cannot attach a foreign key that way, so
+        # on those databases there is no cascade to fire. Doing it explicitly
+        # behaves identically on both, which matters because the difference
+        # would show up as orphaned rows only on upgraded installations.
+        #
+        # Ordered children-first so no step can strand a row it was meant to
+        # remove, and all three run in one transaction.
+        async with self._connect() as conn:
+            await conn.execute(
+                "DELETE FROM leads WHERE job_id IN "
+                "(SELECT id FROM jobs WHERE user_id = ?)", (user_id,))
+            await conn.execute("DELETE FROM jobs WHERE user_id = ?", (user_id,))
+            cursor = await conn.execute(
+                "DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            await conn.commit()
+            return cursor.rowcount or 0
 
     async def session_jobs(self, session_id: str, user_id: str) -> list[Job]:
         # The JOIN onto sessions is the authorisation: no row comes back

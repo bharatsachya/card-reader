@@ -832,3 +832,18 @@ h1, h2, h3 {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Destructive, so it lives at the bottom of the panel and uses the one red the
+   design system reserves for failure and deletion. Not red until hovered --
+   a permanently red control in the corner of the eye reads as an error state. */
+.runs__clear {
+  margin-top: auto;
+  width: 100%;
+  justify-content: center;
+  font-size: 0.8125rem;
+  color: #6b6f72;
+}
+.runs__clear:hover {
+  color: var(--alarm);
+  background: color-mix(in srgb, var(--alarm) 8%, transparent);
+}

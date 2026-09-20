@@ -158,6 +158,42 @@ def verify_token(token: str) -> User:
     return User(id=subject, email=claims.get("email"))
 
 
+# A browser-supplied identity, used ONLY when AUTH_MODE=local.
+#
+# WHAT THIS IS: a random id the browser generates once and keeps in
+# localStorage, so two people opening the public demo URL do not see each
+# other's sessions, and a fresh browser (or cleared site data) starts empty.
+#
+# WHAT THIS IS EMPHATICALLY NOT: authentication. The header is supplied by the
+# client and nothing verifies it, so anyone can send any value with curl and
+# read that id's data. It separates honest users; it stops nobody. Real
+# isolation is AUTH_MODE=clerk, where the token is signed by Clerk and checked
+# against their public keys.
+#
+# It is therefore accepted ONLY in local mode. In clerk mode the header is
+# ignored entirely -- otherwise it would be a trivial way to bypass the very
+# verification that mode exists to perform.
+_CLIENT_ID_HEADER = "X-Client-Id"
+_CLIENT_ID_MAX = 64
+
+
+def _local_user(request: Request) -> User:
+    """The identity used when AUTH_MODE=local: per browser, or a shared default."""
+    raw = (request.headers.get(_CLIENT_ID_HEADER) or "").strip()
+
+    # Constrained to hex and bounded in length. The value becomes a user_id and
+    # reaches SQL as a bound parameter, so injection is not the risk -- but an
+    # unbounded, arbitrary-bytes string would still let a caller write junk
+    # into the database and into log lines, and there is no reason to accept
+    # anything the client is not supposed to be sending.
+    if raw and len(raw) <= _CLIENT_ID_MAX and all(c in "0123456789abcdef" for c in raw):
+        return User(id=f"anon-{raw}", email=None)
+
+    # No usable header: the original single shared user. Keeps `curl` against a
+    # dev box working with no ceremony.
+    return User(id="local", email=None)
+
+
 def _bearer_token(request: Request) -> Optional[str]:
     """Pull the token out of `Authorization: Bearer <token>`."""
     header = request.headers.get("Authorization", "")
@@ -181,7 +217,7 @@ async def require_user(request: Request) -> User:
     runnable by someone who has no Clerk account.
     """
     if not settings.auth_enabled:
-        return User(id="local", email=None)
+        return _local_user(request)
 
     token = _bearer_token(request)
     if token is None:

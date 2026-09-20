@@ -43,14 +43,14 @@ async def client(stub_model, monkeypatch):
         yield http
 
 
-async def run_job_to_completion(client, files, timeout=30.0):
-    response = await client.post("/api/jobs", files=files)
+async def run_job_to_completion(client, files, timeout=30.0, headers=None):
+    response = await client.post("/api/jobs", files=files, headers=headers)
     assert response.status_code == 202, response.text
     job_id = response.json()["job_id"]
 
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
-        poll = await client.get(f"/api/jobs/{job_id}?summary=true")
+        poll = await client.get(f"/api/jobs/{job_id}?summary=true", headers=headers)
         assert poll.status_code == 200
         body = poll.json()
         if body["status"] in {"done", "failed"}:
@@ -294,3 +294,97 @@ async def test_sessions_list_is_paginated_and_scoped(client):
         assert rest["next_cursor"] is None
     finally:
         app.dependency_overrides.clear()
+
+
+# --- per-browser identity (AUTH_MODE=local) -------------------------------
+
+async def test_two_browsers_get_separate_histories(client):
+    """
+    The point of the X-Client-Id header: two people opening the public demo
+    URL must not land in each other's history.
+    """
+    a = {"X-Client-Id": "a" * 32}
+    b = {"X-Client-Id": "b" * 32}
+
+    assert (await client.post("/api/sessions", headers=a)).status_code == 201
+    assert (await client.post("/api/sessions", headers=a)).status_code == 201
+    assert (await client.post("/api/sessions", headers=b)).status_code == 201
+
+    a_ids = {s["session_id"] for s in
+             (await client.get("/api/sessions", headers=a)).json()["sessions"]}
+    b_ids = {s["session_id"] for s in
+             (await client.get("/api/sessions", headers=b)).json()["sessions"]}
+    assert len(a_ids) == 2
+    assert len(b_ids) == 1
+    assert not (a_ids & b_ids), "the two browsers share a session"
+
+    # A browser with no id falls back to the shared `local` identity, which
+    # must see neither of theirs. Asserted as disjointness rather than
+    # emptiness: the store is a module-level singleton, so other tests in this
+    # file have already put sessions under `local`.
+    anon_ids = {s["session_id"] for s in
+                (await client.get("/api/sessions")).json()["sessions"]}
+    assert not (anon_ids & (a_ids | b_ids))
+
+
+async def test_one_browser_cannot_open_anothers_session(client):
+    a = {"X-Client-Id": "c" * 32}
+    b = {"X-Client-Id": "d" * 32}
+    session_id = (await client.post("/api/sessions", headers=a)).json()["session_id"]
+
+    assert (await client.get(f"/api/sessions/{session_id}", headers=a)).status_code == 200
+    assert (await client.get(f"/api/sessions/{session_id}", headers=b)).status_code == 404
+    assert (await client.get(
+        f"/api/sessions/{session_id}/export.xlsx", headers=b)).status_code == 404
+
+
+@pytest.mark.parametrize("bad", [
+    "not-hex-at-all",
+    "A" * 32,            # uppercase: the server constrains to lowercase hex
+    "f" * 200,           # over the length cap
+    "../../etc/passwd",
+    "",
+])
+async def test_a_malformed_client_id_falls_back_instead_of_erroring(client, bad):
+    """
+    A junk header must not 500 and must not become a user id. It degrades to
+    the shared local identity, which is the safe direction.
+    """
+    response = await client.get("/api/sessions", headers={"X-Client-Id": bad})
+    assert response.status_code == 200
+
+
+async def test_clearing_history_actually_deletes(client):
+    """
+    'Cleared' must mean deleted, not merely unreachable -- the store is checked
+    directly rather than through the API that scopes by user.
+    """
+    headers = {"X-Client-Id": "e" * 32}
+    session_id = (await client.post("/api/sessions", headers=headers)).json()["session_id"]
+    files = [("files", ("a.jpg", card_bytes(), "image/jpeg"))]
+    await run_job_to_completion(
+        client, files + [("session_id", (None, session_id))], headers=headers)
+
+    user_id = f"anon-{'e' * 32}"
+    assert await store.all_leads(user_id), "precondition: there is data to delete"
+
+    response = await client.request("DELETE", "/api/sessions", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["deleted_sessions"] >= 1
+
+    assert (await client.get("/api/sessions", headers=headers)).json()["sessions"] == []
+    # gone from storage, not just filtered out of the response
+    assert await store.all_leads(user_id) == []
+    assert (await store.list_sessions(user_id)).sessions == []
+
+
+async def test_clearing_one_browser_leaves_another_untouched(client):
+    keep = {"X-Client-Id": "1" * 32}
+    wipe = {"X-Client-Id": "2" * 32}
+    await client.post("/api/sessions", headers=keep)
+    await client.post("/api/sessions", headers=wipe)
+
+    await client.request("DELETE", "/api/sessions", headers=wipe)
+
+    assert len((await client.get("/api/sessions", headers=keep)).json()["sessions"]) == 1
+    assert (await client.get("/api/sessions", headers=wipe)).json()["sessions"] == []

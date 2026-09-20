@@ -595,6 +595,26 @@ async def list_sessions(
     }
 
 
+@app.delete("/api/sessions")
+async def delete_all_sessions(user: User = Depends(require_user)) -> dict:
+    """
+    Erase every session, job and lead belonging to the caller.
+
+    Scoped to the caller by the same user_id every other route uses, so it can
+    only ever delete your own rows -- there is no id to pass and therefore no
+    id to get wrong.
+
+    The retained card images are not deleted here. They are content-addressed
+    and may be shared with another user's lead (two people photographing the
+    same conference badge produce identical bytes), so deleting by digest could
+    remove an image someone else still references. The startup sweep removes
+    any file no lead points at, which reaches the same end state safely.
+    """
+    removed = await store.delete_everything_for(user.id)
+    log.info("cleared history for %s: %d session(s)", user.id, removed)
+    return {"deleted_sessions": removed}
+
+
 @app.get("/api/sessions/{session_id}")
 async def get_session(
     session_id: str,

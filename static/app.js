@@ -51,9 +51,60 @@ const mark      = el('mark');
 const gate      = el('gate');
 const appRoot   = el('app');
 
+/* ---------- per-browser identity ----------------------------------------
+   Without this, everyone opening the public demo URL shares one identity and
+   therefore one history: you would land on a stranger's cards, and they on
+   yours. A random id kept in localStorage gives each browser its own view, and
+   a fresh browser -- or cleared site data -- starts empty.
+
+   NOT A SECURITY BOUNDARY, and it matters that this is written down. The id is
+   generated here and sent in a header the server does not verify, so anyone
+   can send any value with curl and read that id's data. It separates honest
+   users; it stops nobody. That is the correct trade for an unauthenticated
+   demo, and the real answer is AUTH_MODE=clerk, where the token is signed and
+   checked. The server only honours this header in local mode for exactly that
+   reason.
+
+   localStorage rather than a cookie: no cross-site sending, nothing to attach
+   to requests the user did not make, and clearing site data is the obvious
+   gesture people already know for "forget me". */
+const CLIENT_ID_KEY = 'card-reader.client-id';
+
+function clientId() {
+  try {
+    let id = localStorage.getItem(CLIENT_ID_KEY);
+    if (!id) {
+      /* 16 random bytes as hex. crypto.randomUUID would do, but its dashes
+         are not hex and the server constrains the header to [0-9a-f]. */
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      id = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+      localStorage.setItem(CLIENT_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    /* Private browsing with storage blocked. Returning null means the request
+       goes out without the header and the server falls back to the shared
+       identity -- degraded, but the app still works rather than throwing on
+       every call. */
+    return null;
+  }
+}
+
+/** Start fresh: a new identity, so the old history is no longer reachable. */
+function resetClientId() {
+  try { localStorage.removeItem(CLIENT_ID_KEY); } catch { /* nothing to clear */ }
+  clientId();
+}
+
 /* Set during boot. Every API call goes through this rather than fetch(), so
-   the session token is attached in exactly one place. */
-let api = (path, options) => fetch(path, options);
+   the identity and the session token are attached in exactly one place. */
+let api = (path, options = {}) => {
+  const headers = new Headers(options.headers || {});
+  const id = clientId();
+  if (id) headers.set('X-Client-Id', id);
+  return fetch(path, { ...options, headers });
+};
 
 let chosen = [];          // File objects staged for upload
 let pollTimer = null;
@@ -910,9 +961,11 @@ async function boot() {
     appRoot.hidden = true;
   };
 
-  api = window.CardReaderAuth
-    ? window.CardReaderAuth.makeApi(auth, showGate)
-    : (path, options) => fetch(path, options);
+  /* Published so auth.js's wrapper can attach it without importing anything. */
+  window.cardReaderClientId = clientId();
+
+  if (window.CardReaderAuth) api = window.CardReaderAuth.makeApi(auth, showGate);
+  /* else: the default `api` defined at the top already attaches the id. */
 
   /* A one-line, credential-free view of where auth got to. Printing this
      beats asking someone to paste a network request: those carry live session
@@ -1330,6 +1383,45 @@ el('sidebar-close').addEventListener('click', closeSidebar);
 el('new-session').addEventListener('click', startNewSession);
 scrim.addEventListener('click', closeSidebar);
 runsMore.addEventListener('click', () => loadSessions({ append: true }));
+
+/**
+ * Erase this browser's history, for real.
+ *
+ * Two steps, and both are needed. The DELETE removes the rows server-side --
+ * rotating the local id alone would only make them unreachable, and telling
+ * someone their data is gone when it is merely hidden is not a claim worth
+ * making. The reset then issues a fresh identity, so the next upload starts a
+ * genuinely new history rather than reusing an id whose rows were just
+ * deleted.
+ *
+ * Confirmed first because there is no undo.
+ */
+el('clear-history').addEventListener('click', async () => {
+  const sessions = runsList.children.length;
+  const what = sessions ? plural(sessions, 'session') : 'nothing yet';
+  if (!window.confirm(
+      `Delete ${what} and every card in them? This cannot be undone.`)) return;
+
+  try {
+    const response = await api('/api/sessions', { method: 'DELETE' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch (error) {
+    setHint(`Could not clear history: ${error.message}`, true);
+    return;
+  }
+
+  resetClientId();
+  window.cardReaderClientId = clientId();
+  currentSessionId = null;
+  openSessionId = null;
+  liveReply = null;
+  nextCursor = null;
+  thread.replaceChildren();
+  blank.hidden = false;
+  thread.append(blank);
+  await loadSessions();
+  setHint('History cleared. This browser starts fresh.');
+});
 
 /* ============================================================================
    Lightbox
