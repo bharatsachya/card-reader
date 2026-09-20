@@ -8,6 +8,8 @@ OpenAI-compatible endpoint, and you get back `first_name`, `last_name`,
 `title`, `company`, `location`, `phone`, `email` — normalised, tabulated, and
 downloadable as `.xlsx`.
 
+**Live:** https://51.20.232.225.sslip.io/
+
 ---
 
 ## Quick start
@@ -24,6 +26,10 @@ python3 -m venv .venv
 ```
 
 Open <http://localhost:8000>, drag `samples/batch/` onto the card, watch it run.
+
+To try it without running anything, the deployed instance is at
+**<https://51.20.232.225.sslip.io/>** — the same build, on the hardware every
+measurement in [Performance](#performance) was taken on.
 
 To use a real model instead, point `MODEL_URL` at one (see
 [Model backends](#model-backends)). Nothing else changes.
@@ -64,7 +70,7 @@ curl -s localhost:8000/api/model-check                    # is the MODEL up?
   │        └─ 6. schema.py       ➜ Lead                      │
   │                  │                                       │
   │                  ▼                                       │
-  │   store.py ────► LeadStore (in-memory today)             │
+  │   store.py ────► LeadStore  ──►  SQLite (WAL)             │
   │                                                          │
   │   excel.py ────► GET /api/jobs/{id}/export.xlsx          │
   └──────────────────────────────────────────────────────────┘
@@ -104,7 +110,7 @@ the whole codebase:
 | `app/extraction.py` | Orchestrates one card. Owns the error policy. |
 | `app/uploads.py` | Streams uploads to disk with the size cap enforced mid-stream. |
 | `app/jobs.py` | The background worker and its concurrency semaphore. |
-| `app/store.py` | `LeadStore` interface + in-memory implementation. |
+| `app/store.py` | `LeadStore` interface, `SqliteLeadStore` (shipped) and `InMemoryLeadStore` (tests). Sessions, jobs, leads, cursor pagination, schema migrations. |
 | `app/excel.py` | `.xlsx` generation. |
 | `app/auth.py` | Clerk session verification against the public JWKS. |
 | `app/main.py` | Routes and static mounting. |
@@ -118,6 +124,13 @@ the whole codebase:
 ---
 
 ## Setup
+
+The deployed instance is **<https://51.20.232.225.sslip.io/>** (AWS EC2
+`m7i-flex.large`, 2 vCPU, no GPU, eu-north-1), running the app and Ollama on the
+same box. See [deploy/](deploy/) for the scripts that put it there, and
+[Deployment](#deployment) for how it is wired.
+
+To run it locally instead:
 
 Requires Python 3.11+. Developed and verified on 3.13.
 
@@ -136,17 +149,28 @@ Everything is an environment variable, and everything has a working default.
 | `MODEL_URL` | `http://localhost:11434/v1/chat/completions` | OpenAI-compatible endpoint |
 | `MODEL_NAME` | `qwen2.5vl:3b` | Model identifier sent in the request body |
 | `MODEL_API_KEY` | *(empty)* | Sent as `Authorization: Bearer` when set |
-| `MODEL_TIMEOUT_SECONDS` | `180` | Per-request timeout |
-| `MODEL_MAX_ATTEMPTS` | `3` | Retries per card on transient failure |
+| `MODEL_TIMEOUT_SECONDS` | `600` | Per-request timeout. Slowest measured card is 172 s |
+| `MODEL_MAX_ATTEMPTS` | `3` | Retries per card on transient failure. The deployment sets `2` — see [Chosen configuration](#chosen-configuration-and-why) |
 | `MODEL_RETRY_BASE_SECONDS` | `1` | First backoff wait; doubles each attempt |
 | `MAX_IMAGE_EDGE` | `1024` | Longest edge sent to the model |
 | `MAX_IMAGE_PIXELS` | `89478485` | Decompression-bomb ceiling |
 | `MAX_UPLOAD_BYTES` | `15728640` | 15 MB per file |
-| `MAX_FILES_PER_REQUEST` | `50` | Batch size cap |
+| `MAX_FILES_PER_REQUEST` | `20` | Batch size cap. 20 × 172 s keeps the worst case under an hour |
 | `MAX_CONCURRENCY` | `1` | Cards in flight at once — **this bounds peak memory** |
-| `MAX_JOBS_RETAINED` | `50` | In-memory job history cap |
+| `MAX_JOBS_RETAINED` | `50` | History cap for the **in-memory** backend only; SQLite keeps everything |
 | `DEFAULT_PHONE_REGION` | `IN` | Region assumed for numbers with no country code |
 | `UPLOAD_DIR` | *(system temp)* | Where uploads spool while queued |
+| `STORE_BACKEND` | `sqlite` | `sqlite` persists across restarts; `memory` is the original dict, used by tests |
+| `DB_PATH` | `./data/leads.db` | SQLite file. The deployment uses `/var/lib/card-reader/leads.db` |
+| `IMAGE_DIR` | `./data/images` | Retained normalised card images, content-addressed |
+| `IMAGE_RETENTION_DAYS` | `30` | How long a card image is kept. The **lead** is kept indefinitely |
+| `RECLAIM_STALE_JOBS` | `true` | On startup, fail jobs left `running` by a dead process. Set `false` for >1 replica |
+| `AUTH_MODE` | *(inferred)* | `clerk` or `local`. `clerk` without keys is a hard startup failure |
+
+The **deployment** overrides some of these — see
+[Chosen configuration](#chosen-configuration-and-why) for what it sets and why.
+Where the two differ, the deployment's value is the one running at
+<https://51.20.232.225.sslip.io/>.
 
 ### Model backends
 
@@ -162,6 +186,52 @@ MODEL_NAME=qwen2.5vl:3b
 MODEL_URL=http://10.0.1.23:8080/v1/chat/completions
 MODEL_NAME=Qwen2.5-VL-3B-Instruct-Q4_K_M
 ```
+
+---
+
+## Deployment
+
+The app and the model run on **one** AWS EC2 instance: `m7i-flex.large`,
+2 vCPU, 7.6 GiB, no GPU, `eu-north-1`. Live at
+<https://51.20.232.225.sslip.io/>.
+
+```
+:443  nginx ── TLS (Let's Encrypt, auto-renewing)
+:80   nginx ── 301 → https, plus the ACME challenge path
+        │
+        └─→ :8000  card-reader   (systemd, uvicorn, 1 worker)
+                      │
+                      └─→ 127.0.0.1:11434  Ollama · qwen2.5vl:3b
+
+      /var/lib/card-reader/   SQLite database + retained card images
+```
+
+**Why the model is on the same box, not a separate one.** Ollama binds to
+`127.0.0.1`, so it is unreachable from the internet at all — there is no
+authentication to add because there is no exposed endpoint. No card image
+crosses a network. SQLite gets a real local filesystem rather than a network
+mount, where its locking is unreliable. And it costs nothing: the app is
+`await`-blocked on I/O during the 170 seconds the model is using both cores, so
+it is roughly 0.05% of the CPU cost of a card.
+
+Azure Container Apps was evaluated first and rejected —
+[deploy/AZURE.md](deploy/AZURE.md) records why, chiefly that scale-to-zero
+terminates a replica running a multi-hour batch because the work produces no
+HTTP traffic to keep it alive.
+
+| | |
+|---|---|
+| `deploy/deploy.sh` | Idempotent: venv, `OLLAMA_KEEP_ALIVE=-1`, systemd unit, nginx. Checks Ollama and the model **first** and fails loudly, because every other step can succeed while the app is useless |
+| `deploy/card-reader.service` | systemd unit, `After=ollama.service`, hardened (`ProtectSystem=strict`, `NoNewPrivileges`, restricted address families) |
+| `deploy/nginx-card-reader.conf` | `proxy_read_timeout 900s` — nginx's 60 s default would kill **every** extraction and the symptom would look like model failure |
+| `deploy/enable-tls.sh` | Let's Encrypt on an `sslip.io` hostname, since a public CA will not sign a bare IP |
+
+**Port 80 must stay open.** Renewal uses the HTTP-01 challenge, so closing it
+breaks renewal — not immediately, but when the certificate expires, for a
+reason disconnected from the change that caused it.
+
+Verified after deployment: reboot the instance and all three services return
+with no manual intervention, the database survives, and extraction still works.
 
 ---
 
@@ -619,22 +689,43 @@ so — a fabricated first guess anchors the user and then turns out to be triple
 
 ### Single-process only
 
-`store.py` holds jobs in a module-level dict, so **running under
-`uvicorn --workers N` is broken**. Each worker is a separate OS process with
-its own memory: worker 1 accepts your upload and creates job `abc123`, your
-next poll round-robins to worker 3, which has never heard of it → `404`. The
-job runs fine; you just cannot see it.
+This used to be a storage problem and is now a worker problem. With SQLite,
+several processes **do** see one truth: polling a job from a different worker
+than the one that accepted it returns the right answer, which is exactly what
+the dict could not do.
 
-This is acceptable today because the bottleneck is a model that serves one
-request at a time. The fix is the seam in §10 — swap in a shared store and all
-workers see one truth.
+What remains single-process is the **work itself**. A job's worker is an
+`asyncio` task inside whichever process accepted the upload, so another worker
+can read that job but cannot run, resume or cancel it. If that process dies,
+the job is orphaned until startup reconciliation fails it.
 
-### Jobs do not survive a restart
+So `--workers N` is safe for serving and unsafe for owning work. The deployment
+runs one worker deliberately, which is also the right call for a model that
+serves one request at a time. Distributing the workers themselves means a real
+queue, and that is a different piece of work from the storage seam.
 
-Everything is in memory. A restart loses job history and every extracted lead.
-`MAX_JOBS_RETAINED` (default 50) caps the history so a long-running server does
-not grow until the OOM killer arrives — but that is a leak-limiter, not
-persistence. Same fix: the database seam.
+### What survives a restart, and what does not
+
+Jobs and leads are persisted to SQLite (`STORE_BACKEND=sqlite`, the default and
+what the deployment runs), so **a process restart keeps everything**: sessions,
+jobs, leads, and the retained card images. Verified by killing the service
+mid-batch and restarting it.
+
+Two things still do not survive:
+
+- **The work in flight.** A job's worker is an `asyncio` task inside the
+  process. Kill the process and the task dies with it — but the row does not,
+  so it would claim to be `running` forever and the UI would poll a progress
+  bar that can never finish. On startup the app therefore reconciles any job
+  left `queued`/`running` to `failed` with the reason `interrupted by restart`.
+  Cards already extracted are kept, because leads are committed per card.
+  Disable with `RECLAIM_STALE_JOBS=false` if you ever run more than one
+  replica, or a replica starting later will kill another's live job.
+- **Instance replacement.** The database is a file on the instance's disk
+  (`/var/lib/card-reader/leads.db`), not a managed service or an attached
+  volume. Terminating and recreating the box loses it. `cp leads.db` is a
+  complete backup, which is one of the reasons SQLite was the right choice
+  here; a scheduled copy off-box is the next step and is not implemented.
 
 ### Auth adds a runtime dependency on Clerk
 

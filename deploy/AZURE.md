@@ -1,8 +1,25 @@
-# Deploying to Azure Container Apps
+# Azure Container Apps — evaluated and rejected
 
-You picked Container Apps with an Ollama sidecar. That combination works, but
-**three of its defaults will silently break this app**, and each one has to be
-turned off deliberately. This document is mostly about those three.
+> **This is not how the app is deployed.** It runs on a single EC2 box with the
+> model on `127.0.0.1` — see [../README.md](../README.md#deployment) and
+> [deploy.sh](deploy.sh). This document is kept because the reasons Container
+> Apps was rejected are specific and worth having written down, not because it
+> describes anything that was built.
+
+Container Apps with an Ollama sidecar works, but **three of its defaults
+silently break this app**, and each has to be turned off deliberately. Two of
+the three are why colocating on one box won instead:
+
+- scale-to-zero terminates a replica running an 85-minute batch, because the
+  work generates no HTTP traffic to keep it alive;
+- SQLite on the Azure Files (SMB) mount is a documented corruption risk, since
+  SMB emulates POSIX advisory locks incompletely;
+- the writable filesystem is ephemeral, so both the database and the retained
+  images must live on a mount.
+
+On one EC2 instance none of those apply: the process is always up, the database
+is on a real local filesystem, and nothing is ephemeral. The rest of this
+document is the detail, retained for the record.
 
 ---
 
