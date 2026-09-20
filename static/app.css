@@ -847,3 +847,28 @@ h1, h2, h3 {
   color: var(--alarm);
   background: color-mix(in srgb, var(--alarm) 8%, transparent);
 }
+
+/* THE FIRST CARD HAS NOTHING TO REPORT, AND 0% LOOKS BROKEN.
+   Until a card completes the meter has no real value to show, and on this
+   hardware that is 130-175 seconds of a bar sitting at zero next to a static
+   line of text. A 0% bar and a 0%-but-working bar are indistinguishable, and
+   only one of them is a problem — so while waiting, the fill detaches from the
+   percentage and sweeps instead. It deliberately does NOT imply progress: it
+   is a narrow band travelling across an empty track, which reads as activity
+   rather than as "37% done". */
+.meter.is-waiting .meter__fill {
+  width: 35% !important;
+  animation: meter-sweep 1.6s ease-in-out infinite;
+}
+@keyframes meter-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(285%); }
+}
+
+/* Motion is the whole point of the indeterminate bar, so there is nothing to
+   substitute when it is switched off. The elapsed counter beside it still
+   ticks once a second and carries the same "this is alive" signal without
+   moving anything. */
+@media (prefers-reduced-motion: reduce) {
+  .meter.is-waiting .meter__fill { animation: none; width: 100% !important; opacity: 0.25; }
+}

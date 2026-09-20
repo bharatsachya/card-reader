@@ -448,20 +448,38 @@ function formatDuration(seconds) {
  * the estimate leap around every few minutes, which reads as broken even when
  * each individual number is defensible.
  */
+/** "1m 47s", for a counter that has to visibly move every second. */
+function elapsedLabel(seconds) {
+  const whole = Math.max(0, Math.floor(seconds));
+  if (whole < 60) return `${whole}s`;
+  return `${Math.floor(whole / 60)}m ${String(whole % 60).padStart(2, '0')}s`;
+}
+
 function estimateRemaining(job) {
   const remaining = job.total - job.processed;
   if (remaining <= 0) return '';
-  if (!job.processed) {
-    /* Say what is happening instead of showing a spinner with no content.
-       At >240s per card the first card alone is several minutes, and silence
-       for that long is indistinguishable from a hang. */
-    return 'Working out how long this will take — the first card sets the pace.';
-  }
 
   const startedAt = new Date(job.created_at).getTime();
+  const elapsed = Number.isNaN(startedAt) ? 0 : (Date.now() - startedAt) / 1000;
+
+  if (!job.processed) {
+    /* THE FIRST CARD IS THE WORST CASE AND IT USED TO SAY NOTHING USEFUL.
+       Until a card finishes there is no pace to extrapolate from, so this line
+       was a fixed sentence and the meter sat at 0%. On this hardware a single
+       card takes 130-175 seconds, so the entire screen was motionless for
+       nearly three minutes and looked frozen -- which is exactly the failure
+       the ETA was added to prevent, dodged for cards 2..N and left in place
+       for the one that matters most.
+
+       An elapsed counter is the honest thing to show: it cannot predict, but
+       it proves the job is alive, and it moves every second regardless of how
+       slowly the model is going or how far the poll has backed off. */
+    return `Reading the first card — ${elapsedLabel(elapsed)} elapsed. `
+         + `It sets the pace for the rest.`;
+  }
+
   if (Number.isNaN(startedAt)) return '';
-  const elapsedSeconds = (Date.now() - startedAt) / 1000;
-  const perCard = elapsedSeconds / job.processed;
+  const perCard = elapsed / job.processed;
 
   return `${formatDuration(perCard * remaining)} left · `
        + `${Math.round(perCard)}s per card so far`;
@@ -496,6 +514,26 @@ function pollDelay() {
   return idlePolls >= 5 ? SLOW_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
 }
 
+/* Redraws the estimate once a second, independently of polling.
+   The poll backs off to five seconds once nothing has changed, and during a
+   three-minute card nothing changes at all -- so without this the counter
+   would jump in five-second steps or not at all. A number that ticks every
+   second is the difference between "slow" and "broken" to someone watching. */
+let elapsedTicker = null;
+
+function startElapsedTicker(reply, job) {
+  stopElapsedTicker();
+  elapsedTicker = setInterval(() => {
+    if (!reply.eta || !document.contains(reply.eta)) { stopElapsedTicker(); return; }
+    reply.eta.textContent = estimateRemaining(job);
+  }, 1000);
+}
+
+function stopElapsedTicker() {
+  if (elapsedTicker) clearInterval(elapsedTicker);
+  elapsedTicker = null;
+}
+
 function startPolling(jobId, total, reply) {
   currentJobId = jobId;
   idlePolls = 0;
@@ -517,6 +555,13 @@ async function poll(reply) {
     renderTable(reply, job.leads);
     const pct = job.total ? Math.round((job.processed / job.total) * 100) : 0;
     reply.fill.style.width = `${pct}%`;
+    /* Before the first card lands the bar has nothing to show, so it animates
+       instead of sitting at zero. A 0% bar and a 0%-but-working bar look
+       identical, and only one of them is a problem. */
+    reply.meter.classList.toggle('is-waiting', job.processed === 0);
+    /* Re-seeded each poll so the ticker extrapolates from fresh counters
+       rather than the job object captured when polling began. */
+    startElapsedTicker(reply, job);
 
     if (job.status === 'done' || job.status === 'failed') {
       finishReply(reply, job);
@@ -548,6 +593,7 @@ async function poll(reply) {
 function finishReply(reply, job) {
   clearTimeout(pollTimer);
   pollTimer = null;
+  stopElapsedTicker();
   liveJobId = null;
   liveReply = null;
   setWorking(false);
@@ -568,6 +614,7 @@ function finishReply(reply, job) {
 /** The presentational half: safe to call for any job, live or historical. */
 function paintReplyOutcome(reply, job) {
   reply.statusText.classList.remove('shimmer-text');
+  reply.meter.classList.remove('is-waiting');
   /* A finished job has nothing left to estimate; leaving the last figure on
      screen would read as "still 40 minutes to go" next to a completed table. */
   if (reply.eta) reply.eta.textContent = '';
